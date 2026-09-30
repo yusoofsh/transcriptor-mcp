@@ -2,7 +2,6 @@ import { createHmac } from 'node:crypto';
 import {
   EventHub,
   canonical,
-  signedHeaders,
   type EventStore,
   type Subscription,
   type Delivery,
@@ -31,23 +30,27 @@ const catalog: EventDefinition[] = [
 class Store implements EventStore {
   s = new Map<string, Subscription>();
   d = new Map<string, Delivery>();
-  async subscriptions() {
-    return [...this.s.values()];
+  subscriptions() {
+    return Promise.resolve([...this.s.values()]);
   }
-  async deliveries() {
-    return [...this.d.values()];
+  deliveries() {
+    return Promise.resolve([...this.d.values()]);
   }
-  async putSubscription(s: Subscription) {
+  putSubscription(s: Subscription) {
     this.s.set(s.id, structuredClone(s));
+    return Promise.resolve();
   }
-  async putDelivery(d: Delivery) {
+  putDelivery(d: Delivery) {
     this.d.set(d.id, structuredClone(d));
+    return Promise.resolve();
   }
-  async deleteSubscription(id: string) {
+  deleteSubscription(id: string) {
     this.s.delete(id);
+    return Promise.resolve();
   }
-  async deleteDelivery(id: string) {
+  deleteDelivery(id: string) {
     this.d.delete(id);
+    return Promise.resolve();
   }
 }
 function fixture() {
@@ -60,14 +63,14 @@ function fixture() {
     new EventHub(
       catalog,
       store,
-      async (_url, headers, body) => {
+      (_url, headers, body) => {
         sent.push({ headers, body });
         const data = JSON.parse(body);
-        return data.type === 'verification'
-          ? { status: 200, challenge: data.challenge }
-          : { status };
+        return Promise.resolve(
+          data.type === 'verification' ? { status: 200, challenge: data.challenge } : { status }
+        );
       },
-      async () => allowed,
+      () => Promise.resolve(allowed),
       () => time
     );
   return {
@@ -164,8 +167,8 @@ describe('MCP Events wire and security contract', () => {
     const broken = new EventHub(
       catalog,
       f.store,
-      async () => ({ status: 200, challenge: 'wrong' }),
-      async () => true
+      () => Promise.resolve({ status: 200, challenge: 'wrong' }),
+      () => Promise.resolve(true)
     );
     await expect(broken.handle('events/subscribe', params(), 'owner')).rejects.toMatchObject({
       code: -32015,

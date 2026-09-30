@@ -231,8 +231,9 @@ export function buildMcpHttpApp(opts?: BuildMcpHttpAppOptions): FastifyInstance 
     void events?.flush().catch(() => app.log.warn('MCP event delivery failed'));
   }, 1000);
   eventTimer.unref();
-  app.addHook('onClose', async () => {
+  app.addHook('onClose', () => {
     clearInterval(eventTimer);
+    return Promise.resolve();
   });
 
   // The transport does NOT reject GET/DELETE in stateless mode — a GET would open an SSE

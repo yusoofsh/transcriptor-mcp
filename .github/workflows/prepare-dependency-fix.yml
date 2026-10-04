@@ -1,0 +1,68 @@
+name: Prepare dependency fix
+on:
+  push:
+    branches: [fix/dependency-refresh-2026-10-04]
+    paths: [.github/workflows/prepare-dependency-fix.yml]
+permissions:
+  contents: write
+concurrency:
+  group: dependency-refresh-once
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: github.repository == 'yusoofsh/transcriptor-mcp' && github.ref == 'refs/heads/fix/dependency-refresh-2026-10-04'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/dependency-refresh-2026-10-04
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Replace the broken legacy ESM development runner
+        run: |
+          npm pkg delete devDependencies.ts-node-dev
+          npm pkg set 'scripts.dev=tsx watch src/index.ts' 'scripts.dev:mcp=tsx watch src/mcp.ts' 'scripts.dev:mcp:http=tsx watch src/mcp-http.ts'
+          npm install --package-lock-only --ignore-scripts --save-dev 'tsx@^4'
+      - name: Resolve compatible security patches without forced major upgrades
+        run: |
+          set +e
+          npm audit fix --package-lock-only --ignore-scripts > /tmp/audit-fix.txt 2>&1
+          status=$?
+          set -e
+          cat /tmp/audit-fix.txt
+          if [ "$status" -gt 1 ]; then exit "$status"; fi
+          npm ci
+      - name: Validate formatting and the full non-live gate
+        run: |
+          npx prettier --write package.json
+          make check-no-smoke
+      - name: Record exact lockfile audit evidence
+        if: always()
+        run: |
+          mkdir -p dependency-evidence
+          npm audit --package-lock-only --json > dependency-evidence/all.json || test "$?" -eq 1
+          npm audit --package-lock-only --omit=dev --json > dependency-evidence/runtime.json || test "$?" -eq 1
+          git diff -- package.json > dependency-evidence/manifest.diff
+          cp package.json package-lock.json dependency-evidence/
+      - name: Reject high or critical runtime advisories
+        run: npm audit --package-lock-only --omit=dev --audit-level=high
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-evidence
+          path: dependency-evidence/
+          retention-days: 7
+      - name: Commit only validated manifests to this maintenance branch
+        run: |
+          test "$(git branch --show-current)" = fix/dependency-refresh-2026-10-04
+          git diff --exit-code -- . ':!package.json' ':!package-lock.json'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package.json package-lock.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'Update compatible dependencies and replace the ESM development runner'
+            git push origin HEAD:refs/heads/fix/dependency-refresh-2026-10-04
+          fi

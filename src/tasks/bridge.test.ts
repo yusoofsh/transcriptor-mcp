@@ -43,11 +43,13 @@ it('returns durable handles only to capable clients and protects the real lifecy
     const complete = await call('tasks/get', { taskId });
     expect(complete.body.result).toMatchObject({ resultType: 'complete', status: 'completed', result: { resultType: 'complete', content: [{ type: 'text', text: 'durable result' }], _meta: { preserved: true } } });
     expect(calls).toBe(1);
-    expect((await call('tasks/update', { taskId, inputResponses: { unknown: {} } })).body.result.resultType).toBe('complete');
+    expect((await call('tasks/update', { taskId })).body.error.code).toBe(-32602);
+    const updated = await call('tasks/update', { taskId, inputResponses: { unknown: { action: 'cancel' } } });
+    expect(updated.body).toMatchObject({ result: { resultType: 'complete' } });
+    expect((await call('tasks/get', { taskId })).body.result.status).toBe('completed');
     allowed = false;
     expect((await call('tasks/get', { taskId })).body.error.code).toBe(-32001);
     expect((await call('tasks/cancel', { taskId })).body.error.code).toBe(-32001);
     expect(calls).toBe(1);
     expect(JSON.stringify(complete.body)).not.toContain('private-owner');
   } finally { await handler.close(); rmSync(directory, { recursive: true, force: true }); }
-});

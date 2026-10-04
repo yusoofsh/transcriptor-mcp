@@ -112,11 +112,14 @@ export function configuredTasks(runner: Runner): TaskRuntime | undefined {
   return new TaskRuntime(new DurableTasks(path, Buffer.from(key, 'hex')), owner, authorize, runner);
 }
 export function registerTaskMethods(server: Server, runtime: TaskRuntime): void {
-  const base = z.object({ taskId: z.string().uuid() }).strict();
+  const params = z.object({ taskId: z.string().uuid() }).strict();
+  const responses = z.record(z.string().max(100), z.unknown()).refine(value => Object.keys(value).length <= 16);
   for (const method of ['tasks/get', 'tasks/cancel', 'tasks/update']) {
-    const params = method === 'tasks/update' ? base.extend({ inputResponses: z.record(z.string().max(100), z.unknown()).refine(value => Object.keys(value).length <= 16) }) : base;
     server.setRequestHandler(method, { params, result: z.object({ resultType: z.literal('complete') }).passthrough() }, async (args, ctx) => {
       if (!taskCapable(ctx.mcpReq.envelope)) throw new ProtocolError(-32003, 'Declare the Tasks extension before using task methods', { requiredCapabilities: { extensions: { [tasksCapability]: {} } } });
+      // Reserved inputResponses is lifted by the SDK before custom parameter validation.
+      // It is still required and bounded for update, even when this task has no pending input.
+      if (method === 'tasks/update' && !responses.safeParse(ctx.mcpReq.inputResponses).success) throw new ProtocolError(-32602, 'A bounded inputResponses map is required');
       try {
         if (method === 'tasks/get') return await runtime.get(args.taskId);
         if (method === 'tasks/cancel') return await runtime.cancel(args.taskId);

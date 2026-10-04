@@ -66,6 +66,8 @@ jobs:
           cache-to: type=gha,mode=max,scope=fork-mcp
       - name: Verify the exact image without live accounts or network
         run: node scripts/smoke-image.mjs transcriptor-candidate:test
+      - name: Verify durable Tasks across processes with synthetic authorization and no network
+        run: node scripts/smoke-tasks-image.mjs transcriptor-candidate:test
       - name: Verify source revision
         env:
           SOURCE_SHA: ${{ github.sha }}

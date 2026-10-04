@@ -14,7 +14,8 @@ jest.mock('../mcp-core.js', () => ({
   },
 }));
 function rpc(method: string, params: Record<string, unknown>, capable = true, nameOverride?: string) {
-  const name = String(params.name ?? params.taskId ?? '');
+  const selected = params.name ?? params.taskId;
+  const name = typeof selected === 'string' ? selected : '';
   return new Request('http://localhost/mcp', { method: 'POST', headers: {
     'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2026-07-28', 'mcp-method': method,
     ...(name ? { 'mcp-name': nameOverride ?? name } : {}),

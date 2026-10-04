@@ -25,6 +25,7 @@ jobs:
           node scripts/prepare-workflows.mjs
           npx --no-install tsx scripts/export-workflow-skills.ts
           git rm .github/workflows/prepare-workflows.yml scripts/prepare-workflows.mjs
+          npx --no-install eslint src/workflows/core.ts src/workflows/core.test.ts --fix
           npx --no-install prettier --write src/workflows src/modern-bridge.ts src/mcp-core.ts scripts/export-workflow-skills.ts docs/workflow-runtime.md skills
       - name: Verify the unchanged full gate and runtime dependency audit
         run: make check-no-smoke && npm audit --omit=dev --audit-level=high

@@ -2,6 +2,7 @@
 # A `latest_only` run rebuilds the newest release tag so the baked-in yt-dlp stays
 # current; an n8n workflow fires one whenever yt-dlp cuts a release.
 # Requires DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (or other registry secrets).
+# This inherited workflow is upstream-only; the fork publishes through ci.yml.
 name: Publish Docker
 
 on:
@@ -26,6 +27,7 @@ concurrency:
 
 jobs:
   publish:
+    if: github.repository == 'samson-art/transcriptor-mcp'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.tag.outputs.version }}
@@ -68,7 +70,7 @@ jobs:
       # Test gate: nothing is pushed unless the checked-out ref passes the same checks as CI.
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '24'
           cache: npm
 
       - run: npm ci
@@ -204,7 +206,7 @@ jobs:
   # image and reading its io.modelcontextprotocol.server.name label.
   publish-registry:
     needs: publish
-    if: github.event_name == 'push'
+    if: github.repository == 'samson-art/transcriptor-mcp' && github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       id-token: write # required for `mcp-publisher login github-oidc`

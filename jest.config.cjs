@@ -6,7 +6,11 @@ module.exports = {
   testMatch: ['**/__tests__/**/*.test.ts', '**/?(*.)+(spec|test).ts'],
   transform: {
     '^.+\\.ts$': 'ts-jest',
+    '^.+\\.js$': '<rootDir>/scripts/jest-esm-compat.cjs',
   },
+  transformIgnorePatterns: [
+    'node_modules/(?!(?:@fastify/static/node_modules/)?content-disposition/)',
+  ],
   moduleNameMapper: {
     '^(\\.{1,2}/.*)\\.js$': '$1',
   },

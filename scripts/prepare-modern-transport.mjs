@@ -23,3 +23,7 @@ source = source.slice(0, start) + `  const events = getTranscriptEventHub();
     }
 ` + source.slice(end);
 writeFileSync(path, source);
+const testPath = 'src/modern-bridge.test.ts';
+const testSource = readFileSync(testPath, 'utf8');
+if (!testSource.includes('.json()')) throw new Error('Expected typed fixture response decoding');
+writeFileSync(testPath, testSource.replaceAll('.json()', '.text().then(JSON.parse)'));

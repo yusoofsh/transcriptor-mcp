@@ -300,3 +300,7 @@ MIT © 2026 samson-art. Read [LICENSE](LICENSE).
 ## 💬 Support
 
 [Issues](https://github.com/samson-art/transcriptor-mcp/issues) · [GitHub profile](https://github.com/samson-art) · [LinkedIn](https://www.linkedin.com/in/artem-samsonov-284a66105/)
+
+## MCP Events
+
+See [event configuration and rollout](docs/mcp-events.md).

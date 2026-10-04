@@ -5,6 +5,9 @@
  * between requests, so any instance can answer any request. Authentication is NOT handled
  * here — the deployment terminates OAuth at the gateway in front of this listener.
  */
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { version } from './version.js';
 import Fastify, {
   type FastifyError,
   type FastifyInstance,
@@ -21,6 +24,8 @@ import { setupLifecycle } from './lifecycle.js';
 import { checkYtDlpAtStartup, checkYtDlpVersion } from './yt-dlp-check.js';
 import { startCanary } from './canary.js';
 import { close as closeCache } from './cache.js';
+import { getTranscriptEventHub } from './events/transcriptor.js';
+import { EventError } from './events/core.js';
 
 /** Canonical Streamable HTTP endpoint. Clients POST JSON-RPC here. */
 export const MCP_PATH = '/mcp';
@@ -101,7 +106,88 @@ export function buildMcpHttpApp(opts?: BuildMcpHttpAppOptions): FastifyInstance 
     return reply.header('Content-Type', 'text/plain; charset=utf-8').send(metrics);
   });
 
+  const events = getTranscriptEventHub();
   app.post(MCP_PATH, async (request, reply) => {
+    const rpc = request.body as { id?: unknown; method?: string; params?: Record<string, unknown> };
+    if (events && rpc?.method === 'server/discover') {
+      return reply.send({
+        jsonrpc: '2.0',
+        id: rpc.id ?? null,
+        result: {
+          resultType: 'complete',
+          supportedVersions: ['2026-07-28'],
+          capabilities: { tools: {}, events: {} },
+        },
+      });
+    }
+    if (events && rpc?.method?.startsWith('events/')) {
+      try {
+        return reply.send({
+          jsonrpc: '2.0',
+          id: rpc.id ?? null,
+          result: await events.handle(
+            rpc.method,
+            rpc.params ?? {},
+            process.env.MCP_EVENTS_PRINCIPAL!
+          ),
+        });
+      } catch (error) {
+        const e =
+          error instanceof EventError ? error : new EventError(-32603, 'Event operation failed');
+        return reply.send({
+          jsonrpc: '2.0',
+          id: rpc.id ?? null,
+          error: {
+            code: e.code,
+            message: e.message,
+            ...(e.reason ? { data: { reason: e.reason } } : {}),
+          },
+        });
+      }
+    }
+    const meta = rpc?.params?._meta as Record<string, unknown> | undefined;
+    if (
+      meta?.['io.modelcontextprotocol/protocolVersion'] === '2026-07-28' ||
+      request.headers['mcp-protocol-version'] === '2026-07-28'
+    ) {
+      const server = createMcpServer({ logger: request.log }),
+        client = new Client({ name: 'transcriptor-modern-bridge', version: '1' });
+      const [a, b] = InMemoryTransport.createLinkedPair();
+      try {
+        await server.connect(a);
+        await client.connect(b);
+        let result: unknown;
+        if (rpc.method === 'tools/list') result = await client.listTools(rpc.params);
+        else if (rpc.method === 'tools/call')
+          result = await client.callTool(
+            rpc.params as { name: string; arguments?: Record<string, unknown> }
+          );
+        else if (rpc.method === 'ping') result = {};
+        else throw new EventError(-32601, 'Unknown method');
+        return reply.send({
+          jsonrpc: '2.0',
+          id: rpc.id ?? null,
+          result: {
+            ...(result as object),
+            resultType: 'complete',
+            _meta: { 'io.modelcontextprotocol/serverInfo': { name: 'transcriptor-mcp', version } },
+          },
+        });
+      } catch (error) {
+        const e = error as { code?: number };
+        return reply.send({
+          jsonrpc: '2.0',
+          id: rpc.id ?? null,
+          error: {
+            code: e.code ?? -32603,
+            message: e.code === -32601 ? 'Unknown method' : 'MCP request failed',
+          },
+        });
+      } finally {
+        await client.close();
+        await server.close();
+      }
+    }
     // The transport writes status, headers and body straight to the raw response
     // (including SSE frames), so Fastify must stop managing this reply.
     reply.hijack();
@@ -140,6 +226,15 @@ export function buildMcpHttpApp(opts?: BuildMcpHttpAppOptions): FastifyInstance 
       }
       dispose();
     }
+  });
+
+  const eventTimer = setInterval(() => {
+    void events?.flush().catch(() => app.log.warn('MCP event delivery failed'));
+  }, 1000);
+  eventTimer.unref();
+  app.addHook('onClose', () => {
+    clearInterval(eventTimer);
+    return Promise.resolve();
   });
 
   // The transport does NOT reject GET/DELETE in stateless mode — a GET would open an SSE

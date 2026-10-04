@@ -26,6 +26,8 @@ jobs:
           npm pkg delete devDependencies.ts-node-dev
           npm pkg set 'scripts.dev=tsx watch src/index.ts' 'scripts.dev:mcp=tsx watch src/mcp.ts' 'scripts.dev:mcp:http=tsx watch src/mcp-http.ts'
           npm install --package-lock-only --ignore-scripts --save-dev 'tsx@^4'
+      - name: Apply the reviewed Swagger UI upgrade
+        run: npm install --package-lock-only --ignore-scripts '@fastify/swagger-ui@^6.1.1'
       - name: Resolve compatible security patches without forced major upgrades
         run: |
           set +e
@@ -38,7 +40,8 @@ jobs:
       - name: Validate formatting and the full non-live gate
         run: |
           npx prettier --write package.json
-          make check-no-smoke
+          if ! make check-no-smoke > /tmp/check.log 2>&1; then tail -100 /tmp/check.log; exit 1; fi
+          grep -E 'Test Suites:|Tests:|All matched files|built in' /tmp/check.log
       - name: Record exact lockfile audit evidence
         if: always()
         run: |
@@ -47,6 +50,7 @@ jobs:
           npm audit --package-lock-only --omit=dev --json > dependency-evidence/runtime.json || test "$?" -eq 1
           git diff -- package.json > dependency-evidence/manifest.diff
           cp package.json package-lock.json dependency-evidence/
+          if [ -f /tmp/check.log ]; then cp /tmp/check.log dependency-evidence/; fi
       - name: Reject high or critical runtime advisories
         run: npm audit --package-lock-only --omit=dev --audit-level=high
       - uses: actions/upload-artifact@v4

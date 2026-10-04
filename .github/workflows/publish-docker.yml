@@ -1,12 +1,233 @@
-# The inherited upstream Docker Hub and Registry publisher is not a fork target.
-# This fork publishes its verified MCP image through ci.yml, using its own GHCR namespace.
-name: Upstream release notice
+# Publish Docker images on: version tag push, new GitHub release, or manual run.
+# A `latest_only` run rebuilds the newest release tag so the baked-in yt-dlp stays
+# current; an n8n workflow fires one whenever yt-dlp cuts a release.
+# Requires DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (or other registry secrets).
+# This inherited workflow is upstream-only; the fork publishes through ci.yml.
+name: Publish Docker
+
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
-permissions:
-  contents: read
+    inputs:
+      version:
+        description: 'Version (e.g. 0.4.7 or v0.4.7); required unless latest_only'
+        required: false
+      latest_only:
+        description: 'Rebuild the newest v* tag and publish only :latest (fresh yt-dlp, no version tag)'
+        required: false
+        default: false
+        type: boolean
+
+# Queue runs, never abort one that may already have pushed half of its tags.
+concurrency:
+  group: publish-docker
+  cancel-in-progress: false
+
 jobs:
-  explain:
+  publish:
+    if: github.repository == 'samson-art/transcriptor-mcp'
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
     steps:
-      - run: echo 'Use the verified main-branch CI image pipeline; no upstream registry writes are performed by this fork.'
+      - name: Validate workflow_dispatch inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          if [ "${{ inputs.latest_only }}" != "true" ]; then
+            if [ -z "${{ inputs.version }}" ]; then
+              echo "::error::version is required when latest_only is false. Set version or use latest_only=true."
+              exit 1
+            fi
+          fi
+
+      - name: Get ref to build
+        id: ref
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.latest_only }}" = "true" ]; then
+              # Newest v* tag; runs before checkout, so ask the remote directly.
+              tag=$(git ls-remote --tags --refs "${{ github.server_url }}/${{ github.repository }}.git" 'refs/tags/v*' | awk -F/ '{print $NF}' | sort -V | tail -1)
+              [ -n "$tag" ] || { echo "::error::no v* tag to rebuild"; exit 1; }
+              echo "ref=refs/tags/$tag" >> $GITHUB_OUTPUT
+            else
+              v="${{ inputs.version }}"
+              [ "${v#v}" = "$v" ] && v="v$v"
+              echo "ref=refs/tags/$v" >> $GITHUB_OUTPUT
+            fi
+          elif [ "${{ github.event_name }}" = "release" ]; then
+            echo "ref=refs/tags/${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "ref=${{ github.ref }}" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.ref }}
+          fetch-depth: 0
+
+      # Test gate: nothing is pushed unless the checked-out ref passes the same checks as CI.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - run: npm ci
+
+      # v1.4.1 shipped from a merge commit that missed the PR's late review fixes.
+      # Stop a tag push before any image push when the merge does not contain the whole PR.
+      - name: Tag is a merge commit that contains its whole PR
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          node -e 'process.stdout.write(JSON.stringify({ tool_input: { command: `git tag ${process.argv[1]} ${process.argv[2]}` } }))' "$TAG" "$(git rev-parse HEAD)" \
+            | node .claude/hooks/guard-release.mjs
+
+      - name: Lint, typecheck, unit tests, build (also builds dist/e2e for the smokes below)
+        run: make check-no-smoke
+
+      - name: Set up QEMU and buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract tag and image tags
+        id: tag
+        run: |
+          # A latest_only run republishes only :latest from the newest release tag,
+          # so the released :<version> tag stays immutable.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.latest_only }}" = "true" ]; then
+            version=$(jq -r .version package.json)
+            echo "latest_only=true" >> $GITHUB_OUTPUT
+            echo "api_tags=artsamsonov/transcriptor-mcp-api:latest" >> $GITHUB_OUTPUT
+            echo "mcp_tags=artsamsonov/transcriptor-mcp:latest" >> $GITHUB_OUTPUT
+          else
+            echo "latest_only=false" >> $GITHUB_OUTPUT
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              v="${{ inputs.version }}"
+            elif [ "${{ github.event_name }}" = "release" ]; then
+              v="${{ github.event.release.tag_name }}"
+            else
+              v="${{ github.ref_name }}"
+            fi
+            version="${v#v}"
+            {
+              echo "api_tags<<EOF"
+              echo "artsamsonov/transcriptor-mcp-api:$version"
+              echo "artsamsonov/transcriptor-mcp-api:latest"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+            {
+              echo "mcp_tags<<EOF"
+              echo "artsamsonov/transcriptor-mcp:$version"
+              echo "artsamsonov/transcriptor-mcp:latest"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          fi
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      # No `cache-from` in this workflow on purpose: a cached pip layer would freeze yt-dlp;
+      # each job gets a fresh builder, so `pip install -U yt-dlp` resolves anew.
+      # The multi-arch builds below reuse the amd64 layers from this same builder.
+      - name: Build MCP image for smoke (amd64, kept local)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: mcp
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: transcriptor-mcp:smoke
+
+      # yt-dlp prints the table either way; without curl_cffi every row ends in "(unavailable)".
+      - name: Impersonation targets available (curl_cffi)
+        run: |
+          n=$(docker run --rm transcriptor-mcp:smoke yt-dlp --list-impersonate-targets | grep -Eci '^chrome.*curl_cffi[[:space:]]*$')
+          echo "::notice::$n Chrome impersonation targets available"
+
+      - name: MCP smoke (initialize, tools/list, GET→405, stdio; no YouTube)
+        run: SMOKE_SKIP_BUILD=1 SMOKE_SKIP_TRANSCRIPT=1 SMOKE_MCP_IMAGE=transcriptor-mcp:smoke npm run test:e2e:mcp
+
+      - name: Build API image for smoke (amd64, kept local)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: api
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: transcriptor-mcp-api:smoke
+
+      # /changelogs must return this checkout's CHANGELOG.md, so an image without the file fails here.
+      # A dispatch can check out an older tag. Tags without api-checks.ts ignore SMOKE_SKIP_TRANSCRIPT
+      # and would call YouTube, so this step skips them.
+      # ponytail: drop the if once no tag that a dispatch can rebuild is older than api-checks.ts.
+      - name: API smoke (/docs, /changelogs; no YouTube)
+        if: hashFiles('src/e2e/api-checks.ts') != ''
+        run: SMOKE_SKIP_BUILD=1 SMOKE_SKIP_MCP=1 SMOKE_SKIP_TRANSCRIPT=1 SMOKE_IMAGE_API=transcriptor-mcp-api:smoke npm run test:e2e:api
+
+      - name: Build and push REST API image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: api
+          push: true
+          tags: ${{ steps.tag.outputs.api_tags }}
+          platforms: linux/amd64,linux/arm64
+
+      - name: Build and push MCP image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: mcp
+          push: true
+          tags: ${{ steps.tag.outputs.mcp_tags }}
+          platforms: linux/amd64,linux/arm64
+
+      - name: Log yt-dlp version in image
+        run: |
+          IMG="artsamsonov/transcriptor-mcp-api:${{ steps.tag.outputs.latest_only == 'true' && 'latest' || steps.tag.outputs.version }}"
+          docker pull "$IMG"
+          echo "::notice::yt-dlp in image $IMG: $(docker run --rm $IMG yt-dlp --version 2>/dev/null | head -1)"
+
+  # Publish the server entry to registry.modelcontextprotocol.io.
+  # Runs after `publish` because the registry validates ownership by pulling the
+  # image and reading its io.modelcontextprotocol.server.name label.
+  publish-registry:
+    needs: publish
+    if: github.repository == 'samson-art/transcriptor-mcp' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # required for `mcp-publisher login github-oidc`
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync server.json to the released version
+        run: |
+          jq --arg v "${{ needs.publish.outputs.version }}" \
+            '.version = $v
+             | .packages[0].identifier = "docker.io/artsamsonov/transcriptor-mcp:" + $v' \
+            server.json > server.tmp && mv server.tmp server.json
+          cat server.json
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar xz mcp-publisher
+
+      - name: Publish to the MCP Registry
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

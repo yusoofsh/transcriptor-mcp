@@ -8,7 +8,9 @@ export const tasksCapability = 'io.modelcontextprotocol/tasks';
 export const taskOperations = new Set(['get_transcript', 'get_playlist_transcripts']);
 type Runner = (input: TaskInput, signal: AbortSignal) => Promise<CallToolResult>;
 function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
 }
 export function taskCapable(envelope: unknown): boolean {
   const capabilities = record(record(envelope)?.['io.modelcontextprotocol/clientCapabilities']);
@@ -24,53 +26,88 @@ export class TaskRuntime {
   readonly store: DurableTasks;
   private readonly authorize: () => Promise<boolean>;
   private readonly runner: Runner;
-  constructor(store: DurableTasks, owner: string, authorize: () => Promise<boolean>, runner: Runner, automatic = true) {
-    this.store = store; this.owner = owner; this.authorize = authorize; this.runner = runner;
+  constructor(
+    store: DurableTasks,
+    owner: string,
+    authorize: () => Promise<boolean>,
+    runner: Runner,
+    automatic = true
+  ) {
+    this.store = store;
+    this.owner = owner;
+    this.authorize = authorize;
+    this.runner = runner;
     if (!owner) throw new Error('Task owner is required');
     if (automatic) {
-      this.timer = setInterval(() => { void this.processOne().catch(() => {}); }, 1000);
+      this.timer = setInterval(() => {
+        void this.processOne().catch(() => {});
+      }, 1000);
       this.timer.unref();
     }
   }
   private async checkAuthorization(): Promise<void> {
-    if (!(await this.authorize().catch(() => false))) throw new TaskAccessError(-32001, 'Current authorization is required');
+    if (!(await this.authorize().catch(() => false)))
+      throw new TaskAccessError(-32001, 'Current authorization is required');
   }
   async start(name: string, args: Record<string, unknown>, traceparent?: string) {
     await this.checkAuthorization();
-    if (this.stopping || !taskOperations.has(name)) throw new TaskAccessError(-32602, 'This operation is not task-enabled');
-    const task = this.store.create(this.owner, { name, arguments: args, ...(traceparent ? { traceparent } : {}) });
+    if (this.stopping || !taskOperations.has(name))
+      throw new TaskAccessError(-32602, 'This operation is not task-enabled');
+    const task = this.store.create(this.owner, {
+      name,
+      arguments: args,
+      ...(traceparent ? { traceparent } : {}),
+    });
     return { ...task, resultType: 'task' as const };
   }
-  async get(id: string) { await this.checkAuthorization(); return { ...this.store.describe(this.owner, id), resultType: 'complete' as const }; }
-  async cancel(id: string) { await this.checkAuthorization(); this.store.cancel(this.owner, id); return { resultType: 'complete' as const }; }
+  async get(id: string) {
+    await this.checkAuthorization();
+    return { ...this.store.describe(this.owner, id), resultType: 'complete' as const };
+  }
+  async cancel(id: string) {
+    await this.checkAuthorization();
+    this.store.cancel(this.owner, id);
+    return { resultType: 'complete' as const };
+  }
   async update(id: string) {
     // This runtime currently issues no inputRequests. Unknown response keys are ignored,
     // but ownership, expiry and current authorization are still checked.
-    await this.checkAuthorization(); this.store.describe(this.owner, id);
+    await this.checkAuthorization();
+    this.store.describe(this.owner, id);
     return { resultType: 'complete' as const };
   }
   processOne(): Promise<void> {
     if (this.stopping || this.active) return this.active ?? Promise.resolve();
     const work = this.performOne();
     this.active = work;
-    void work.finally(() => { if (this.active === work) this.active = undefined; }).catch(() => {});
+    void work
+      .finally(() => {
+        if (this.active === work) this.active = undefined;
+      })
+      .catch(() => {});
     return work;
   }
   private async performOne(): Promise<void> {
+    if (!this.store.hasWork(this.owner)) return;
     await this.checkAuthorization();
     if (this.stopping) return;
     const job = this.store.claim(this.owner, this.worker);
     if (!job) return;
-    const controller = new AbortController(); this.controller = controller;
+    const controller = new AbortController();
+    this.controller = controller;
     let checking = false;
     const heartbeat = setInterval(() => {
       if (checking) return;
       checking = true;
       void (async () => {
         try {
-          if (!(await this.authorize()) || !this.store.heartbeat(this.owner, job.id, this.worker)) controller.abort();
-        } catch { controller.abort(); }
-        finally { checking = false; }
+          if (!(await this.authorize()) || !this.store.heartbeat(this.owner, job.id, this.worker))
+            controller.abort();
+        } catch {
+          controller.abort();
+        } finally {
+          checking = false;
+        }
       })();
     }, 5000);
     heartbeat.unref();
@@ -79,7 +116,13 @@ export class TaskRuntime {
       await this.checkAuthorization();
       this.store.finish(this.owner, job.id, this.worker, result);
     } catch (error) {
-      const code = error instanceof Error && 'code' in error && typeof error.code === 'number' && Number.isInteger(error.code) ? error.code : -32603;
+      const code =
+        error instanceof Error &&
+        'code' in error &&
+        typeof error.code === 'number' &&
+        Number.isInteger(error.code)
+          ? error.code
+          : -32603;
       this.store.fail(this.owner, job.id, this.worker, code);
     } finally {
       clearInterval(heartbeat);
@@ -87,10 +130,22 @@ export class TaskRuntime {
     }
   }
   async close(): Promise<void> {
+    if (this.stopping) {
+      try {
+        await this.active;
+      } catch {
+        /* Already shutting down. */
+      }
+      return;
+    }
     this.stopping = true;
     if (this.timer) clearInterval(this.timer);
     this.controller?.abort();
-    try { await this.active; } catch { /* No caller data or source errors are logged. */ }
+    try {
+      await this.active;
+    } catch {
+      /* No caller data or source errors are logged. */
+    }
     this.store.close();
   }
 }
@@ -101,33 +156,55 @@ export function configuredTasks(runner: Runner): TaskRuntime | undefined {
   const key = process.env.MCP_EVENTS_STATE_KEY;
   const check = process.env.MCP_EVENTS_AUTH_CHECK_URL;
   const token = process.env.MCP_EVENTS_AUTH_CHECK_TOKEN;
-  if (!principal || !key || !/^[a-fA-F0-9]{64}$/.test(key) || !check || !token) throw new Error('Tasks require the existing private ingress authorization settings and persistent state key');
+  if (!principal || !key || !/^[a-fA-F0-9]{64}$/.test(key) || !check || !token)
+    throw new Error(
+      'Tasks require the existing private ingress authorization settings and persistent state key'
+    );
   const endpoint = new URL(check);
-  if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.hash) throw new Error('Tasks require a valid HTTPS authorization checker');
-  const owner = createHash('sha256').update(principal + '\0' + endpoint.origin + endpoint.pathname).digest('hex');
+  if (endpoint.protocol !== 'https:' || endpoint.username || endpoint.password || endpoint.hash)
+    throw new Error('Tasks require a valid HTTPS authorization checker');
+  const owner = createHash('sha256')
+    .update(principal + '\0' + endpoint.origin + endpoint.pathname)
+    .digest('hex');
   const authorize = async () => {
-    const response = await fetch(check, { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(5000), headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' }, body: JSON.stringify({ principal }) });
+    const response = await fetch(check, {
+      method: 'POST',
+      redirect: 'error',
+      signal: AbortSignal.timeout(5000),
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ principal }),
+    });
     return response.ok && record(await response.json())?.authorized === true;
   };
   return new TaskRuntime(new DurableTasks(path, Buffer.from(key, 'hex')), owner, authorize, runner);
 }
 export function registerTaskMethods(server: Server, runtime: TaskRuntime): void {
   const params = z.object({ taskId: z.string().uuid() }).strict();
-  const responses = z.record(z.string().max(100), z.unknown()).refine(value => Object.keys(value).length <= 16);
+  const responses = z
+    .record(z.string().max(100), z.unknown())
+    .refine((value) => Object.keys(value).length <= 16);
   for (const method of ['tasks/get', 'tasks/cancel', 'tasks/update']) {
-    server.setRequestHandler(method, { params, result: z.object({ resultType: z.literal('complete') }).passthrough() }, async (args, ctx) => {
-      if (!taskCapable(ctx.mcpReq.envelope)) throw new ProtocolError(-32003, 'Declare the Tasks extension before using task methods', { requiredCapabilities: { extensions: { [tasksCapability]: {} } } });
-      // Reserved inputResponses is lifted by the SDK before custom parameter validation.
-      // It is still required and bounded for update, even when this task has no pending input.
-      if (method === 'tasks/update' && !responses.safeParse(ctx.mcpReq.inputResponses).success) throw new ProtocolError(-32602, 'A bounded inputResponses map is required');
-      try {
-        if (method === 'tasks/get') return await runtime.get(args.taskId);
-        if (method === 'tasks/cancel') return await runtime.cancel(args.taskId);
-        return await runtime.update(args.taskId);
-      } catch (error) {
-        if (error instanceof TaskAccessError) throw new ProtocolError(error.code, error.message);
-        throw new ProtocolError(-32603, 'Task operation is unavailable');
+    server.setRequestHandler(
+      method,
+      { params, result: z.object({ resultType: z.literal('complete') }).passthrough() },
+      async (args, ctx) => {
+        if (!taskCapable(ctx.mcpReq.envelope))
+          throw new ProtocolError(-32003, 'Declare the Tasks extension before using task methods', {
+            requiredCapabilities: { extensions: { [tasksCapability]: {} } },
+          });
+        // Reserved inputResponses is lifted by the SDK before custom parameter validation.
+        // It is still required and bounded for update, even when this task has no pending input.
+        if (method === 'tasks/update' && !responses.safeParse(ctx.mcpReq.inputResponses).success)
+          throw new ProtocolError(-32602, 'A bounded inputResponses map is required');
+        try {
+          if (method === 'tasks/get') return await runtime.get(args.taskId);
+          if (method === 'tasks/cancel') return await runtime.cancel(args.taskId);
+          return await runtime.update(args.taskId);
+        } catch (error) {
+          if (error instanceof TaskAccessError) throw new ProtocolError(error.code, error.message);
+          throw new ProtocolError(-32603, 'Task operation is unavailable');
+        }
       }
-    });
+    );
   }
 }

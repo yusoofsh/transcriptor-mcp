@@ -4,6 +4,15 @@ import {
   subtitleViewerResource,
 } from './workflows/subtitle-viewer.js';
 import { workflowSkills } from './workflows/skills.js';
+import {
+  configuredTasks,
+  registerTaskMethods,
+  taskOperations,
+  taskCapable,
+  tasksCapability,
+  type TaskRuntime,
+} from './tasks/runtime.js';
+import { CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';
 import { privateResult, forwardMeta } from './workflows/core.js';
 import {
   createMcpHandler,
@@ -21,7 +30,11 @@ import { version } from './version.js';
 import { EventError, type EventHub } from './events/core.js';
 
 /** Validate modern requests once, retaining the original authorized business handlers. */
-export function createModernHandler(events?: EventHub, logger?: FastifyBaseLogger) {
+export function createModernHandler(
+  events?: EventHub,
+  logger?: FastifyBaseLogger,
+  injectedTasks?: TaskRuntime
+) {
   async function delegated<T>(read: (client: Client) => Promise<T>): Promise<T> {
     const source = createMcpServer({ logger }),
       client = new Client({ name: 'transcriptor-compatibility', version });
@@ -35,13 +48,33 @@ export function createModernHandler(events?: EventHub, logger?: FastifyBaseLogge
       await source.close();
     }
   }
-  return createMcpHandler(
+  const tasks =
+    injectedTasks ??
+    configuredTasks((input, signal) =>
+      delegated(async (client) =>
+        CallToolResultSchema.parse(
+          await client.callTool(
+            {
+              name: input.name,
+              arguments: input.arguments,
+              _meta: forwardMeta(undefined, { traceparent: input.traceparent }),
+            },
+            undefined,
+            { signal }
+          )
+        )
+      )
+    );
+  const handler = createMcpHandler(
     () => {
       const server = new Server(
         { name: 'transcriptor-mcp', version },
         {
           capabilities: {
-            extensions: { 'io.modelcontextprotocol/skills': {} },
+            extensions: {
+              'io.modelcontextprotocol/skills': {},
+              ...(tasks ? { [tasksCapability]: {} } : {}),
+            },
             tools: {},
             resources: {},
             prompts: {},
@@ -49,6 +82,7 @@ export function createModernHandler(events?: EventHub, logger?: FastifyBaseLogge
           },
         }
       );
+      if (tasks) registerTaskMethods(server, tasks);
       server.setRequestHandler(
         'skills/list',
         {
@@ -99,6 +133,13 @@ export function createModernHandler(events?: EventHub, logger?: FastifyBaseLogge
         };
       });
       server.setRequestHandler('tools/call', async (request, ctx) => {
+        if (tasks && taskOperations.has(request.params.name) && taskCapable(ctx.mcpReq.envelope)) {
+          return (await tasks.start(
+            request.params.name,
+            request.params.arguments ?? {},
+            forwardMeta(undefined, ctx.mcpReq._meta).traceparent as string | undefined
+          )) as unknown as CallToolResult;
+        }
         if (request.params.name === subtitleViewerTool.name) {
           const args = z
             .object({
@@ -242,4 +283,13 @@ export function createModernHandler(events?: EventHub, logger?: FastifyBaseLogge
     },
     { legacy: 'reject' }
   );
+  return tasks
+    ? {
+        fetch: handler.fetch.bind(handler),
+        close: async () => {
+          await tasks.close();
+          await handler.close();
+        },
+      }
+    : handler;
 }

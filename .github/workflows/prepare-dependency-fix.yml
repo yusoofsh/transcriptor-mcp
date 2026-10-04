@@ -37,7 +37,7 @@ jobs:
           cat /tmp/audit-fix.txt
           if [ "$status" -gt 1 ]; then exit "$status"; fi
           npm ci
-      - name: Validate formatting and the full non-live gate
+      - name: Validate the ESM transform and the full non-live gate
         run: |
           npx prettier --write package.json
           if ! make check-no-smoke > /tmp/check.log 2>&1; then tail -100 /tmp/check.log; exit 1; fi

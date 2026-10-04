@@ -1,0 +1,17 @@
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+mkdirSync('src/workflows', { recursive: true });
+const response = await fetch('https://raw.githubusercontent.com/yusoofsh/moodle-mcp/34d09452b6008001d29972d0d14b72f9c4595911/src/workflows/core.ts');
+if (!response.ok) throw new Error('Reviewed shared source unavailable');
+const bytes = Buffer.from(await response.arrayBuffer());
+if (createHash('sha1').update(Buffer.from('blob '+bytes.length+'\0')).update(bytes).digest('hex') !== 'dfc557e2781e2a3cef17e45f746a11f42d7aeaae') throw new Error('Reviewed source digest mismatch');
+writeFileSync('src/workflows/core.ts', bytes);
+const tests = await fetch('https://raw.githubusercontent.com/yusoofsh/moodle-mcp/33da225b63b8fbfe39745202b0001dedd1a25e7b/tests/workflow-foundation.test.ts');
+if (!tests.ok) throw new Error('Reviewed foundation tests unavailable');
+writeFileSync('src/workflows/core.test.ts', (await tests.text()).replace('import { describe, it, expect } from "vitest";\n','').replaceAll('../src/workflows/','./'));
+const path='src/mcp-core.ts';let source=readFileSync(path,'utf8');
+if(source.includes('registerWorkflowResources')) throw new Error('Integration already changed');
+source="import { registerWorkflowResources } from './workflows/resources.js';\n"+source;
+const start=source.indexOf('new McpServer('),end=source.indexOf(');',start)+2;
+if(start<0||end<2) throw new Error('Expected original MCP construction');
+source=source.slice(0,end)+'\n  registerWorkflowResources(server);'+source.slice(end);writeFileSync(path,source);

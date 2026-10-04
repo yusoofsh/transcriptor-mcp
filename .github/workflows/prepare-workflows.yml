@@ -1,0 +1,38 @@
+name: Prepare transcript workflows
+on:
+  push:
+    branches: [feat/workflow-runtime-20261004]
+    paths: [.github/workflows/prepare-workflows.yml, scripts/prepare-workflows.mjs]
+permissions:
+  contents: write
+concurrency:
+  group: prepare-transcript-workflows
+  cancel-in-progress: true
+jobs:
+  prepare:
+    if: github.repository == 'yusoofsh/transcriptor-mcp' && github.ref == 'refs/heads/feat/workflow-runtime-20261004'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Integrate reviewed source and remove temporary preparation
+        run: |
+          node scripts/prepare-workflows.mjs
+          npx --no-install tsx scripts/export-workflow-skills.ts
+          git rm .github/workflows/prepare-workflows.yml scripts/prepare-workflows.mjs
+          npx --no-install prettier --write src/workflows src/modern-bridge.ts src/mcp-core.ts scripts/export-workflow-skills.ts docs/workflow-runtime.md skills
+      - name: Verify the unchanged full gate and runtime dependency audit
+        run: make check-no-smoke && npm audit --omit=dev --audit-level=high
+      - name: Commit validated source only on the feature branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/workflows src/modern-bridge.ts src/mcp-core.ts scripts/export-workflow-skills.ts docs/workflow-runtime.md skills
+          git diff --cached --check
+          git commit -m 'Validate subtitle viewing, digest skills and private trace-aware results'
+          git push origin HEAD:refs/heads/feat/workflow-runtime-20261004

@@ -2,7 +2,7 @@ name: Prepare durable Tasks
 on:
   push:
     branches: [feat/1.5.20-durable-task-runtime]
-    paths: [.github/workflows/prepare-durable-tasks.yml, scripts/prepare-durable-tasks.mjs, src/tasks/**]
+    paths: [.github/workflows/prepare-durable-tasks.yml, scripts/prepare-durable-tasks.mjs, scripts/harden-task-store.mjs, src/tasks/**]
 permissions:
   contents: write
 concurrency:
@@ -20,10 +20,11 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - name: Apply the reviewed opt-in runtime integration
+      - name: Apply the reviewed restart fixes and opt-in runtime integration
         run: |
+          node scripts/harden-task-store.mjs
           node scripts/prepare-durable-tasks.mjs
-          git rm scripts/prepare-durable-tasks.mjs .github/workflows/prepare-durable-tasks.yml
+          git rm scripts/harden-task-store.mjs scripts/prepare-durable-tasks.mjs .github/workflows/prepare-durable-tasks.yml
           npx --no-install prettier --write src/tasks src/modern-bridge.ts
       - name: Verify the complete source and security gates
         run: make check-no-smoke && npm audit --omit=dev --audit-level=high

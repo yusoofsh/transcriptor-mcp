@@ -27,7 +27,7 @@ jobs:
           npx --no-install prettier --write src/mcp-http.ts src/modern-bridge.ts src/modern-bridge.test.ts package.json
       - name: Verify types, protocol fixtures and runtime dependencies
         run: |
-          npm run typecheck
+          npm run type-check
           npx --no-install jest src/modern-bridge.test.ts --runInBand
           npm audit --omit=dev --audit-level=high
       - name: Commit the validated adapter and npm-generated lock only

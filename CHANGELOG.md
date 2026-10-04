@@ -7,11 +7,134 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.19] - 2026-09-30
+
+### Fixed
+
+- The `get_transcript` widget showed an empty card for every error. It now shows the error text. For an answer that lists the video's tracks, the widget also shows those tracks under official and auto. An example is the track list that a call without `lang` can get since 1.5.13. If the answer cuts a list, the widget shows how many tracks it left out. The widget has no track picker (#62).
+
+## [1.5.18] - 2026-09-30
+
+### Fixed
+
+- A track that brought no text was not remembered, so the same call again spent one more caption request on the same track (#60). This was true with and without `lang`. The server now remembers such a track for `CACHE_TTL_METADATA_SECONDS` (1 hour by default), the same time as a track list. Within that time the same call gets the same answer and sends no caption request. After that time the server asks for the track again, because "no text" can also be a failure about the video that ends. A failed run, such as a network error, is not remembered. With Redis caching, this adds a cache key shape: `sub:{url}:{type}:{lang}:{format}:empty`. The canary does not read or write it.
+- Off YouTube, a call that named a track after a list answer ran the metadata request again, only to get the video id (#60). It now reads the id from the track list that the list answer cached. That lookup counts in `cache_hits_total{kind="avail"}` or `cache_misses_total{kind="avail"}`.
+
+## [1.5.17] - 2026-09-30
+
+### Fixed
+
+- With speech-to-text on, the canary counted an empty caption track as a working path when speech-to-text answered the probe. It set `transcriptor_canary_ok` to 1 and could end a failure streak while captions failed. The probe now never falls back to speech-to-text. An empty track is a failed probe: the gauge goes to 0 and the streak goes on. The probe also no longer costs a transcription. Its empty track does not count in `subtitles_extraction_failures_total{reason="no_subtitles"}`, which counts a failure only when speech-to-text ran.
+- A speech-to-text answer that came after `WHISPER_TIMEOUT` went into the cache, also for a call that skips the cache. The canary probe skips the cache, so a late answer to it could be stored as the official English track of the canary video. Calls that asked for that track by name (`type: "official"`, `lang: "en"`) then got speech-to-text text instead of captions until the entry expired (`CACHE_TTL_SUBTITLES_SECONDS`, 7 days by default). A call that skips the cache now stores no transcript, also late.
+
+## [1.5.16] - 2026-09-30
+
+### Fixed
+
+- `YT_DLP_NO_WARNINGS=1` no longer applies to metadata runs (video info, chapters, subtitle lists). With `YT_DLP_IGNORE_NO_FORMATS` at its default, the metadata run on a private, removed or bot-checked video exits 0 and names the refusal only in a warning. With `YT_DLP_NO_WARNINGS=1`, the server did not see that warning. `get_video_info` then returned a stub (`youtube video #<id>`) instead of an error, and `get_transcript` without `lang` could start speech-to-text instead of answering 502 `bot_check`. Other yt-dlp runs still get `--no-warnings` when it is 1. Nothing changes when it is not set, and no yt-dlp run is added.
+
+## [1.5.15] - 2026-09-30
+
+### Fixed
+
+- A caption hold no longer sends one Sentry event per call. During a hold ([ADR 002](docs/adr/002-caption-rate-limit-hold.md)), the server answers each call that misses the cache with a 502 and sends no request to the platform. Each of these answers sent an error event, so 50 calls during one hold sent 50 events. A burst of such calls can use up the Sentry quota. Now these answers send no event. The 429 of a platform run that starts a hold still sends one event. Callers get the same 502 and text, and the metrics and the "MCP tool call" log line do not change.
+- A REST 5xx event in Sentry now has the `route` tag and the video URL (`requestUrl` in the `request` context). Sentry's Fastify integration comes with tracing, which is on by default (`SENTRY_TRACES_SAMPLE_RATE=0.1`). It sent the error first, marked unhandled, before the REST error handler ran. Sentry then dropped the report of the error handler as a duplicate, and with it the tag and the context. The integration now only traces, and the error handler sends the one event. The MCP HTTP server works the same way for a 5xx outside a tool call. These events are now marked handled, so a Sentry filter on unhandled errors no longer shows them.
+
+## [1.5.14] - 2026-09-30
+
+### Security
+
+- `GET /failures` is gone from the REST API. It showed any caller the video URLs of the last 100 failed subtitle requests of all callers, links to unlisted videos included (#56). The server no longer keeps that list. `subtitles_extraction_failures_total{reason}` still counts the failures. `GET /failures` now answers 404 like any path with no route.
+- `GET /metrics` on the REST API has a limit of 60 requests a minute for each client address. It had no limit, and each call serializes all metrics. A Prometheus scrape every 15 s sends 4 requests a minute. This limit counts apart from `RATE_LIMIT_MAX`, so other requests from the address of the scraper do not use it up. `GET /health` and `GET /health/ready` stay unlimited. The `/metrics` of the MCP HTTP server did not change. Limit it at the edge ([ADR 001](docs/adr/001-stateless-streamable-http.md)).
+
+### Changed
+
+- The REST metrics `http_requests_total` and `http_request_duration_seconds` put every request to a path with no route under `route="unmatched"`. Before, each path was a `route` value of its own. Each new path added about 14 series, and they stayed until a restart. A dashboard or an alert that selects such a path by its `route` value now finds nothing. Select `route="unmatched"` instead.
+
+### Fixed
+
+- The REST API does not start when it cannot read `RATE_LIMIT_TIME_WINDOW`, and it prints why. Before, it started, and every rate-limited request answered 500. For example, `docker run --env-file` keeps the quotes of `RATE_LIMIT_TIME_WINDOW="1 minute"`. Use a number of milliseconds or a duration such as `1 minute`, without quotes. A value below 1 millisecond is refused too. Before, zero also answered 500 on every rate-limited request, and a negative value or a value between 0 and 1 millisecond turned the limit off.
+
+## [1.5.13] - 2026-09-26
+
+### Changed
+
+- Without `lang`, subtitles come back in the video's original language, or as a list to choose from. An English YouTube video that lists an Arabic official track answered in Arabic (#54), and one video could answer in two languages, depending on the cache. The server now asks for one track at most: the track in the original language. When it cannot tell which track that is, or that track brings no text, it answers "no subtitles" with the list of tracks and one next step: pass `type` and `lang`. Most platforms other than YouTube do not report a language, so there a video with two or more tracks gets the list. On YouTube, a video with two or more official tracks and no automatic captions gets it too. Off YouTube, an empty track list asks for `lang` when speech-to-text is off or did not run. Chat replays (`live_chat`, `rechat`) are no longer listed as subtitles, and a `lang` that names one is refused before any run. Speech-to-text runs only for a video that lists no tracks. `subtitle_tracks_untried_total` also counts the tracks a list answer did not request, and `subtitles_extraction_failures_total{reason="no_subtitles"}` counts a failure only when speech-to-text ran. `cache_hits_total{kind="sub"}` and `cache_misses_total{kind="sub"}` count each lookup, so a call without `lang` that finds its track under the track's own name counts a miss and then a hit. With Redis caching, answers cached before this release are served until they expire (`CACHE_TTL_SUBTITLES_SECONDS`). Decision: [ADR 006](docs/adr/006-original-language-without-lang.md).
+- `type` without `lang` no longer means `lang: "en"`. It runs the same auto-discovery, kept to that type: `type: "auto"` on a Russian video returns the Russian `-orig` track instead of a machine translation into English. On YouTube this adds the metadata run that auto-discovery always had. Off YouTube, if the track list is empty, it asks for `lang` and does not start speech-to-text: TikTok, Bilibili and Reddit list their tracks only to a request that names one.
+- `get_playlist_transcripts` needs `lang`. Without it, or with a `lang` the server cannot use, the tool used to fetch English. Now it asks for a usable `lang` before it runs anything.
+- The `get_video_info` and `search_videos` widgets open the track in the video's original language when the track list shows it (a lone `-orig` track), instead of the alphabetically first official one; otherwise English first.
+
+## [1.5.12] - 2026-09-26
+
+### Fixed
+
+- An idle server probed every second canary interval, and a recovery through real traffic was silent. The canary stands down when a track from its platform came back within the last `CANARY_INTERVAL_MS`, and its own probe's track counted too. At the next tick that track was one interval minus the run old, so the tick stood down. An idle server probed 48 times a day where it should have probed 96 at the default fifteen minutes (12 instead of 24 at one hour). A path that broke could take three intervals instead of two to raise `canary: transcript path failing`. Now only a track from a real call makes a tick stand down: a track that came back after the track of the canary's last successful probe. When such a call ends a failure streak, the canary sends `canary: transcript path recovered`, as a probe does, with a `via` tag of `probe` or `traffic`. Before, it set `transcriptor_canary_ok` back to 1 and sent nothing.
+- After a caption 429, a track from before the 429 ended a canary failure streak. The canary set `transcriptor_canary_ok` to 1 and sent `canary: transcript path recovered`, but nothing had come back since the refusal. The canary now does not stand down after a 429 until a track comes back. During the hold its probe stops at the hold, with no request to the platform.
+- A `CANARY_URL` given as a bare video id never let real traffic stand the canary down. The canary looked for the last track under the wrong platform, so it probed at every interval. It now reads the URL the same way the probe does.
+
+## [1.5.11] - 2026-09-26
+
+### Security
+
+- `GET /health/sentry-test` is gone. It threw on purpose, so every call sent one error event to Sentry, and it was not rate-limited: anyone who could reach a public REST API with `SENTRY_DSN` set could spend the whole Sentry quota. Nothing used it. To make sure that a DSN accepts events, send it a test event with `sentry-cli`: `SENTRY_DSN=<dsn> sentry-cli send-event -m test`. The server itself sends an event only for a real 5xx.
+
+### Fixed
+
+- `RATE_LIMIT_MAX` now covers `GET /failures`, `GET /changelogs` and every path that has no route. The two routes were declared before the rate-limit plugin had loaded, so they were never limited. On 2026-09-25 with `RATE_LIMIT_MAX=3`, `/failures` still answered 200 on the fifth request. A path with no route answered 404 with no limit. The limit counts per client address across every limited route. `GET /health`, `GET /health/ready` and `GET /metrics` stay unlimited on purpose, so that a probe or a Prometheus scrape never gets a 429. A CORS preflight request (`OPTIONS`) is not limited either. `GET /health/ready` now logs only warnings and errors, like `GET /health`.
+
+## [1.5.10] - 2026-09-26
+
+### Security
+
+- An unplanned REST error no longer sends its own message to the caller. The REST API answered every error with its message, so an error nobody planned for could show an internal detail: while the API image lacked `CHANGELOG.md`, `GET /changelogs` answered `ENOENT: no such file or directory, open '/app/CHANGELOG.md'`. A 5xx that is not one of the server's own errors now answers the text MCP tools already used — `Internal server error (a fault in this server, not in your request)…` — and the real error goes to the log and to Sentry as before. The MCP HTTP transport's own error handler (outside tool calls) does the same. So does an MCP resource read, such as `transcriptor://transcript/{videoId}` or a widget page, on HTTP and stdio: its error carried its own message, for example a cookies path. The REST log line of such an error now carries the request id, which links it to the log lines of its request.
+
+### Fixed
+
+- The REST API answers 400 and 429 where it answered 500. Every error that was not one of the server's own became a 500: a body that failed the schema (`body must have required property 'url'`), a body that was not JSON, and a request over `RATE_LIMIT_MAX` — each reported to Sentry as an error. They now keep Fastify's status and message, labelled `Bad request` or `Too many requests`, and are no longer sent to Sentry: under a burst, one event per rejected request would spend the quota the limit protects. In `http_requests_total`, these requests move from `status_code="500"` to `400` or `429`, so an alert on the REST 5xx rate sees fewer events.
+
+## [1.5.9] - 2026-09-26
+
+### Fixed
+
+- `GET /changelogs` works in the REST API image. From 0.5.9, when the endpoint arrived, to 1.5.8, the image shipped without `CHANGELOG.md`, so every call answered HTTP 500, put the file's absolute path in the response body and sent an error event to Sentry. The image now carries the file. The API smoke test fails if the endpoint does not return it. The MCP image does not serve this route and is unchanged.
+- `.env.example` lists five env vars the server already read: `YT_DLP_FRAME_TIMEOUT`, `YT_DLP_JS_RUNTIMES`, `YT_DLP_REMOTE_COMPONENTS`, `YT_DLP_NO_WARNINGS` and `YT_DLP_IGNORE_NO_FORMATS`, with their defaults. Nothing about them changed. Do not set `YT_DLP_NO_WARNINGS=1`: the server reads yt-dlp warnings to classify failures, so a private, removed or bot-checked video can then look like a normal one. A test now fails when the code reads an env var that the file does not name.
+
+## [1.5.8] - 2026-09-24
+
+### Changed
+
+- **Caption tracks are downloaded by yt-dlp only.** Since 1.4.0 a track listed with its own URL was fetched straight from Node — 0.2 s against the 4–7 s of a yt-dlp run. On 2026-09-24 YouTube refused those requests with `HTTP 429` seven times between 12:09 and 19:18 UTC — nine refused direct fetches over the week against none for yt-dlp — while the same track came through yt-dlp, with the server's cookies and its browser impersonation, eight minutes after a refusal. The direct fetch is gone, and `SUBTITLE_FETCH_TIMEOUT_MS` with it. A transcript that is not cached costs the 4–7 s of a yt-dlp run where it cost 0.2 s; the explicit `type`/`lang` path no longer runs yt-dlp for the JSON in front of the track (the id is in a YouTube URL, and for any other platform that run comes after the track), so its total stays at one run for YouTube. `subtitle_requests_total` keeps its `path` label, now always `yt_dlp`.
+- **A refusal after the hold counts as the next strike, however long the hold has been over.** The hold counted a repeat only when it came within ten minutes of the previous wait ending, so on a sparse day every 429 read as the first one: the wait never grew past ten minutes, and nothing said that this address was banned. Only a track resets the count now, and the canary asks for one every `CANARY_INTERVAL_MS` while nothing else answers (fifteen minutes by default, an hour on the hosted server).
+
+### Added
+
+- `subtitle_rate_limit_strikes{platform}`: refusals in a row from a platform's caption endpoint with no track in between, 0 once a track arrives. Two or more means the platform refused again after the hold ran out, with no track handed over in between — the address is banned. The alert to build on it is `max by (platform) (subtitle_rate_limit_strikes{platform="youtube"}) >= 2`, for the platform the canary keeps asking; it resolves when a track comes back, and also on a restart, because the count lives in the process — if the ban holds, it fires again after the next hold. `SUBTITLES_RATE_LIMIT_HOLD_MS=0` turns the count off with the hold.
+
+## [1.5.7] - 2026-09-24
+
+### Fixed
+
+- **A frame that could not be taken could hold its processes for 8 to 22 minutes.** Each stage of `get_video_frame` — the stream lookup, up to two direct reads, the section download, the frame from the clip — got the whole timeout for itself, and an ffmpeg stopped by that timeout did not stop: it acts on `SIGTERM` between packets, and one blocked in a network read gets there only when the read returns. On 2026-09-24 eight failed calls lasted 470–1327 s each; with four quicker failures, failed frames took 7,500 of the 10,690 seconds that all tools worked on this version. The client repeated each call every 30 s with the same arguments, so four ffmpeg processes read the same stream at once and the process cap was reached. A call now has one budget for all of its stages. ffmpeg is stopped with `SIGKILL` and gives up on a read that stalls for 15 s — the ffmpeg that yt-dlp starts for the section download too, since it outlives a yt-dlp stopped by the timeout. A call repeated with the same arguments while the first one runs waits for that run instead of starting another.
+- **One interrupted yt-dlp run could leave every later run without cookies.** yt-dlp rewrites the cookies file it is given when it exits, and empties it first. A writable file was handed over as it was, so a run killed during that write left the file empty, and every run after it refused the file as not a Netscape cookies file — on this server from 09:54 UTC on 2026-09-24, hidden for a while by the cache. Every run now gets its own copy, whether the original is writable or not, readable only by the server's user.
+- **A video dubbed into many languages could not be read.** yt-dlp lists every automatic caption language once per audio track: one 17-minute video with 21 audio tracks gave 11.7 MB of JSON, more than the 10 MB the server accepted from yt-dlp, so the run was killed — and that kill is the one that emptied the cookies file above. The limit is now 50 MB, and JSON over 10 MB is logged with its length.
+- **`get_playlist_transcripts` with `maxItems` answered with no transcripts.** When yt-dlp stops at `--max-downloads` it exits with 101, and the handler for that exit read the downloaded files only after the temporary directory holding them had been removed. It now reads them first.
+
+### Changed
+
+- `YT_DLP_FRAME_TIMEOUT` (default: `YT_DLP_TIMEOUT`) now limits a whole `get_video_frame` call, including the time its processes wait for a free slot, instead of each process the call starts. A stage that would start after the limit does not start, and the call answers with the `timeout` text. `0` still means no limit.
+- The example compose file mounts `cookies.txt` read-only: the server never writes the file it is given.
+
+## [1.5.6] - 2026-09-23
+
+### Fixed
+
+- **The first rate limit after a restart was invisible to anything watching `subtitle_requests_total`.** A Prometheus counter series that first appears already holding the value it was incremented to gives `increase()` no earlier sample to compare against, so the step it should produce reads as a flat line. Measured on this server: a caption request was refused with `HTTP 429` at 15:00 UTC on 2026-09-23, the series `{outcome="rate_limited"}` came into existence at 1, and a rule watching for an increase over the last fifteen minutes stayed silent — at exactly the moment such a rule exists for, since a restart also clears the in-process hold that keeps the server from feeding the limit. Every platform now gets all six series (two paths by three outcomes) at zero before its first request leaves the server, so a refusal is a step from a value that was already being scraped. Counting is unchanged; only the zeroes are new.
+
 ## [1.5.5] - 2026-09-23
 
 ### Changed
 
-- **Every error a tool returns now names one next step, and no tool overwrites the sentence below it any more.** Four tools replaced whatever the layer beneath them had said with a fixed line of their own — "Failed to fetch video info.", "Failed to capture a frame for this video." — so a caller that had been told *why* never saw it. In the week of 2026-09-17, 50 failed calls came from 39 addresses with up to six repeats of one address: the texts said what failed and nothing about whether repeating would help. The overrides are gone, the reason from below reaches the caller, and where a video does have tracks the answer now ends with them, ranked (`-orig` first, then the language just asked for, then English) and cut at fifteen per list with a pointer to the full list.
+- **Every error a tool returns now names one next step, and no tool overwrites the sentence below it any more.** Four tools replaced whatever the layer beneath them had said with a fixed line of their own — "Failed to fetch video info.", "Failed to capture a frame for this video." — so a caller that had been told _why_ never saw it. In the week of 2026-09-17, 50 failed calls came from 39 addresses with up to six repeats of one address: the texts said what failed and nothing about whether repeating would help. The overrides are gone, the reason from below reaches the caller, and where a video does have tracks the answer now ends with them, ranked (`-orig` first, then the language just asked for, then English) and cut at fifteen per list with a pointer to the full list.
 - **"No subtitles" says what was asked for, what speech-to-text did, what the track list looks like, and exactly one thing to do next.** The old sentence claimed Whisper had been tried when this server has it off, pointed at `GET /subtitles/available` (a route that is POST, and means nothing to an MCP caller), and told a caller who had passed neither `type` nor `lang` to omit them. It also said auto-discovery tries three official and three automatic tracks, which stopped being true in 1.5.4. Each of those is now a separate fact with its own branch — including the difference between a track list that is empty and one that could not be read, which used to be the same sentence.
 - **The dead ends that could not name a reason answer with one text instead of three**, and the same is true of the five tools that rejected a URL: they each said "Invalid video URL." without saying which platforms are supported or that a link without `https://` is refused even on a supported one. The language code text now describes the rule the server actually enforces — letters, digits, hyphens and underscores, up to 32 characters — rather than a narrower one it invented; a caller following the old wording would have rejected the very track names this server hands out (`en_US`, `en-nP7-2PuUl7o`). The cursor error says how long the text it paginates is, the search failure names the arguments worth dropping, and an empty playlist reports the `type` and `lang` the server actually used rather than the ones it was passed.
 - **A frame that could not be captured says at which timestamp.** At any timestamp past zero it offers one earlier retry; at `00:00:00.000` it does not, because "retry with an earlier timestamp" there is byte for byte the call that just failed.
@@ -26,7 +149,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Auto-discovery asks for the track somebody wanted, and asks at most twice.** It used to walk up to three official languages and then three automatic ones, in alphabetical order, so a video listing `ar, de, en` spent two requests before reaching the one the caller would use, and a single call could spend six requests against a caption budget a day-long 429 is measured in. Tracks are now ranked before anything is asked for — the audio's own language first (YouTube's `-orig` track, or the language the platform reports), then English, then the rest — and the ladder stops after the best official and the best automatic track. Most videos are answered by the first request rather than the third. `subtitle_tracks_untried_total` counts every listed track the cap left unasked when the ladder came back empty: that is the upper bound on transcripts this costs, and the number to watch if callers start hearing "no subtitles" for videos that have some.
+- **Auto-discovery asks for the track somebody wanted, and asks at most twice.** It used to walk up to three official languages and then three automatic ones, in alphabetical order, so a video listing `ar, de, en` spent two requests before reaching the one the caller would use, and a single call could spend six requests against a caption budget a day-long 429 is measured in. Tracks are now ranked before anything is asked for — the audio's own language first (YouTube's `-orig` track, or the language the platform reports), then English, then the rest — and the ladder stops after two tracks: it alternates between the ranked official and automatic lists, so a video that lists both gets its best of each, and a video that lists one kind gets the two best of that kind. Most videos are answered by the first request rather than the third. `subtitle_tracks_untried_total` counts every listed track the cap left unasked when the ladder came back empty: that is the upper bound on transcripts this costs, and the number to watch if callers start hearing "no subtitles" for videos that have some.
 - **The canary does not probe when a real transcript just came back from the same platform.** The probe exists to prove the caption path still works, and it spent a request every interval whether or not the path had just proved itself. A successful transcript is the same proof, already paid for. The probe now runs only when nothing has answered for a whole interval — which is also the only time its answer is news. The gauge and the alert are unchanged: an observed success sets `transcriptor_canary_ok` exactly as a probe would, so a platform that stops answering still shows up within one interval. On the hosted server this drops the probe from 24 caption requests a day to none during any hour with traffic.
 
 ## [1.5.3] - 2026-09-22
@@ -186,7 +309,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **README widget section shows the real interface:** the single `example-usage.webp` is replaced by four screenshots, one per widget, captured from the production bundles driven by real server payloads. All four use MCP and AI-workflow material, so the images speak to the audience the README is written for: a `search_videos` carousel for *"model context protocol MCP server production"*, a `get_video_frame` capture of an agent-to-server architecture slide, a `get_transcript` view of a 3-minute MCP explainer with official captions, and a `get_video_info` card showing views, likes, and a 169-language caption picker. They live in [assets/](assets).
+- **README widget section shows the real interface:** the single `example-usage.webp` is replaced by four screenshots, one per widget, captured from the production bundles driven by real server payloads. All four use MCP and AI-workflow material, so the images speak to the audience the README is written for: a `search_videos` carousel for _"model context protocol MCP server production"_, a `get_video_frame` capture of an agent-to-server architecture slide, a `get_transcript` view of a 3-minute MCP explainer with official captions, and a `get_video_info` card showing views, likes, and a 169-language caption picker. They live in [assets/](assets).
 - **Widgets heading no longer breaks its own anchor:** the heading emoji carried a U+FE0F variation selector, which GitHub keeps in the generated slug, so the `#-widgets` links in the MCP Apps badge and the nav bar resolved to nothing. Replaced with an emoji that needs no variation selector.
 - **FAQ section removed** from the README.
 
@@ -538,7 +661,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **README.md:** Docker build for REST API now uses `-f Dockerfile --target api`.
 - **`docs/quick-start.rest.md`:** Docker build command updated to use `-f Dockerfile --target api`.
 - **`docs/configuration.md`:** Added `.env.local.example` usage for local overrides with sensitive values.
-- **`docker-hub-description.md`:** Added Optional Redis cache to Features; env table extended with CACHE_*, MCP_RATE_LIMIT_*, MCP_SESSION_*, SHUTDOWN_TIMEOUT; reference to `docker-compose.example.yml` for full Whisper/COOKIES setup.
+- **`docker-hub-description.md`:** Added Optional Redis cache to Features; env table extended with CACHE*\*, MCP_RATE_LIMIT*_, MCP*SESSION*_, SHUTDOWN_TIMEOUT; reference to `docker-compose.example.yml` for full Whisper/COOKIES setup.
 
 ## [0.4.8] - 2026-02-13
 
@@ -574,7 +697,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Optional Redis cache:** Responses for subtitles, video info, available subtitles, and chapters can be cached in Redis to reduce repeated yt-dlp calls. Configure via env: `CACHE_MODE` (`off` or `redis`), `CACHE_REDIS_URL` (required when `redis`), `CACHE_TTL_SUBTITLES_SECONDS` (default 7 days for subtitles), `CACHE_TTL_METADATA_SECONDS` (default 1 hour for video info, available subtitles, chapters). New `src/cache.ts` with `getCacheConfig()`, `get()`, `set()`, `close()`. Both REST API and MCP use the cache when enabled. Documented in `docs/caching.md`, `docs/configuration.md`, and `.env.example`.
 - **MCP uses validation layer:** MCP tools now call `validateAndDownloadSubtitles`, `validateAndFetchAvailableSubtitles`, `validateAndFetchVideoInfo`, and `validateAndFetchVideoChapters` instead of calling youtube/whisper directly, so MCP benefits from the same cache and validation as the REST API. Removed private `fetchSubtitlesContent` from `mcp-core.ts`; tools catch `ValidationError` and `NotFoundError` and return tool errors.
-- **Unit tests:** `cache.test.ts` for `getCacheConfig` (mode, TTLs from env), get/set when `CACHE_MODE=off`, and `close()`. `validation.test.ts` mocks `./cache.js` so existing tests run with cache disabled. `mcp-core.test.ts` updated to mock validation’s validateAnd* and expect corresponding calls.
+- **Unit tests:** `cache.test.ts` for `getCacheConfig` (mode, TTLs from env), get/set when `CACHE_MODE=off`, and `close()`. `validation.test.ts` mocks `./cache.js` so existing tests run with cache disabled. `mcp-core.test.ts` updated to mock validation’s validateAnd\* and expect corresponding calls.
 
 ### Changed
 

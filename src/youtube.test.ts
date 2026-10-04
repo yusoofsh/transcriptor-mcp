@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { tmpdir } from 'os';
-import { join, basename } from 'path';
-import { access, constants, writeFile, unlink } from 'node:fs/promises';
+import { join, basename, dirname } from 'path';
+import { access, constants, readFile, stat, writeFile, unlink } from 'node:fs/promises';
 import * as youtube from './youtube.js';
 import {
   noteSubtitlesRateLimited,
@@ -32,7 +32,7 @@ const {
   appendYtDlpAudioArgs,
   appendYtDlpSubtitleArgs,
   resolveSubtitleFormat,
-  ensureWritableCookiesFile,
+  copyCookiesFile,
   urlToSafeBase,
   collectExecFileErrorDetails,
   classifyYtDlpFailure,
@@ -302,163 +302,6 @@ today to pay our respects to MCP, which
     });
   });
 
-  describe('downloadSubtitleTrackDirect', () => {
-    const TIMEDTEXT = 'https://www.youtube.com/api/timedtext?v=x&fmt=vtt&lang=en';
-    const data = {
-      id: 'x',
-      subtitles: { en: [{ ext: 'vtt', url: TIMEDTEXT }] },
-      automatic_captions: {
-        en: [
-          // YouTube lists the auto track as an HLS manifest as well; it must be skipped.
-          {
-            ext: 'vtt',
-            url: 'https://manifest.googlevideo.com/api/manifest/hls/playlist/index.m3u8',
-          },
-          { ext: 'vtt', url: TIMEDTEXT },
-        ],
-      },
-    };
-    let fetchMock: jest.Mock;
-
-    beforeEach(() => {
-      jest.clearAllMocks();
-      fetchMock = jest.fn();
-      globalThis.fetch = fetchMock as unknown as typeof fetch;
-    });
-
-    function answer(body: string, status = 200) {
-      fetchMock.mockResolvedValue({ ok: status < 400, status, text: () => Promise.resolve(body) });
-    }
-
-    it('should fetch the track listed for the language and skip the HLS manifest', async () => {
-      answer('WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi');
-      await expect(
-        youtube.downloadSubtitleTrackDirect(data, 'auto', 'en', 'vtt')
-      ).resolves.toContain('WEBVTT');
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-      expect(fetchMock.mock.calls[0][0]).toBe(TIMEDTEXT);
-    });
-
-    it('should ask as the browser yt-dlp claims to be', async () => {
-      answer('WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi');
-      await youtube.downloadSubtitleTrackDirect(data, 'official', 'en', 'vtt');
-      const headers = (fetchMock.mock.calls[0][1] as { headers: Record<string, string> }).headers;
-      expect(headers['User-Agent']).toMatch(/^Mozilla\/5\.0 .*Chrome\/\d+\.0\.0\.0 Safari/);
-      expect(headers['Accept-Language']).toBe('en-us,en;q=0.5');
-    });
-
-    it('should read only listed tracks, not Object.prototype', async () => {
-      for (const lang of ['toString', 'constructor', 'hasOwnProperty']) {
-        await expect(
-          youtube.downloadSubtitleTrackDirect(data, 'official', lang, 'vtt')
-        ).resolves.toBeNull();
-      }
-      expect(fetchMock).not.toHaveBeenCalled();
-    });
-
-    it('should give up when the answer is not the requested subtitles', async () => {
-      answer('<html>sign in</html>');
-      await expect(
-        youtube.downloadSubtitleTrackDirect(data, 'official', 'en', 'vtt')
-      ).resolves.toBeNull();
-
-      answer('WEBVTT', 403);
-      await expect(
-        youtube.downloadSubtitleTrackDirect(data, 'official', 'en', 'vtt')
-      ).resolves.toBeNull();
-
-      fetchMock.mockRejectedValue(new Error('network down'));
-      await expect(
-        youtube.downloadSubtitleTrackDirect(data, 'official', 'en', 'vtt')
-      ).resolves.toBeNull();
-    });
-
-    it('should reject an error page that carries an HTML comment as srt', async () => {
-      // srt is what detectSubtitleFormat calls anything it does not recognise, and every
-      // HTML comment contains the "-->" a cue line also has.
-      answer('<!DOCTYPE html><html><!-- consent gate --><body>Sign in</body></html>');
-      await expect(
-        youtube.downloadSubtitleTrackDirect(
-          { subtitles: { en: [{ ext: 'srt', url: TIMEDTEXT }] } },
-          'official',
-          'en',
-          'srt'
-        )
-      ).resolves.toBeNull();
-
-      answer('1\n00:00:01,000 --> 00:00:02,000\nhi\n');
-      await expect(
-        youtube.downloadSubtitleTrackDirect(
-          { subtitles: { en: [{ ext: 'srt', url: TIMEDTEXT }] } },
-          'official',
-          'en',
-          'srt'
-        )
-      ).resolves.toContain('-->');
-    });
-
-    it('should leave the track to yt-dlp when a proxy is configured', async () => {
-      process.env.YT_DLP_PROXY = 'http://proxy.invalid:3128';
-      try {
-        answer('WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi');
-        await expect(
-          youtube.downloadSubtitleTrackDirect(data, 'official', 'en', 'vtt')
-        ).resolves.toBeNull();
-        expect(fetchMock).not.toHaveBeenCalled();
-      } finally {
-        delete process.env.YT_DLP_PROXY;
-      }
-    });
-
-    it('should not fetch anything when the format or language is not listed', async () => {
-      await expect(
-        youtube.downloadSubtitleTrackDirect(data, 'official', 'en', 'srt')
-      ).resolves.toBeNull();
-      await expect(
-        youtube.downloadSubtitleTrackDirect(data, 'official', 'ru', 'vtt')
-      ).resolves.toBeNull();
-      await expect(
-        youtube.downloadSubtitleTrackDirect(null, 'official', 'en', 'vtt')
-      ).resolves.toBeNull();
-      expect(fetchMock).not.toHaveBeenCalled();
-    });
-
-    it('should let downloadSubtitles answer without running yt-dlp', async () => {
-      answer('WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi');
-      const content = await youtube.downloadSubtitles(
-        'https://www.youtube.com/watch?v=x',
-        'official',
-        'en',
-        'vtt',
-        undefined,
-        data
-      );
-      expect(content).toContain('WEBVTT');
-      expect(execFileMock).not.toHaveBeenCalled();
-    });
-
-    it('should fall back to yt-dlp when the direct fetch gives nothing', async () => {
-      answer('nope', 500);
-      execFileMock.mockImplementation(
-        (
-          _file: string,
-          _args: string[],
-          _options: unknown,
-          callback: (error: Error | null, result?: { stdout: string; stderr: string }) => void
-        ) => callback(new Error('yt-dlp ran'))
-      );
-      await youtube.downloadSubtitles(
-        'https://www.youtube.com/watch?v=x',
-        'official',
-        'en',
-        'vtt',
-        undefined,
-        data
-      );
-      expect(execFileMock).toHaveBeenCalled();
-    });
-  });
-
   describe('downloadSubtitles', () => {
     beforeEach(() => {
       jest.clearAllMocks();
@@ -497,7 +340,7 @@ today to pay our respects to MCP, which
       dateSpy.mockRestore();
     });
 
-    it('should return null when no subtitle file is found', async () => {
+    it("should return '' when the run brings no subtitle file", async () => {
       const url = 'https://www.youtube.com/watch?v=video-no-file';
       const timestamp = 1234567891;
       const dateSpy = jest.spyOn(Date, 'now').mockReturnValue(timestamp);
@@ -521,12 +364,12 @@ today to pay our respects to MCP, which
 
       const result = await downloadSubtitles(url, 'auto', 'en');
 
-      expect(result).toBeNull();
+      expect(result).toBe('');
 
       dateSpy.mockRestore();
     });
 
-    it('should return null when subtitle file is empty', async () => {
+    it("should return '' when the subtitle file is empty", async () => {
       const url = 'https://www.youtube.com/watch?v=video-empty';
       const content = '   ';
       const timestamp = 1234567892;
@@ -551,7 +394,7 @@ today to pay our respects to MCP, which
 
       const result = await downloadSubtitles(url, 'auto', 'en');
 
-      expect(result).toBeNull();
+      expect(result).toBe('');
       await expect(access(subtitleFilePath, constants.F_OK)).resolves.toBeUndefined();
 
       dateSpy.mockRestore();
@@ -594,9 +437,6 @@ today to pay our respects to MCP, which
   });
 
   describe('downloadSubtitles under a platform rate limit', () => {
-    const TIMEDTEXT = 'https://www.youtube.com/api/timedtext?v=x&fmt=vtt&lang=en';
-    const data = { id: 'x', subtitles: { en: [{ ext: 'vtt', url: TIMEDTEXT }] } };
-    const CUE = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nhi';
     let fetchMock: jest.Mock;
 
     beforeEach(() => {
@@ -612,32 +452,65 @@ today to pay our respects to MCP, which
       return line ? Number(line.split(' ').pop()) : 0;
     }
 
-    it('counts what it spends on the caption endpoint, by path, and nothing else', async () => {
-      const direct429 = 'platform="youtube",path="direct",outcome="rate_limited"';
+    async function seriesExists(labels: string): Promise<boolean> {
+      return (await renderPrometheus())
+        .split('\n')
+        .some((l) => l.startsWith(`subtitle_requests_total{${labels}`));
+    }
+
+    async function strikes(platform: string): Promise<number> {
+      const line = (await renderPrometheus())
+        .split('\n')
+        .find((l) => l.startsWith(`subtitle_rate_limit_strikes{platform="${platform}"`));
+      return line ? Number(line.split(' ').pop()) : -1;
+    }
+
+    it('never fetches a listed track itself: the platform only ever sees yt-dlp', async () => {
+      // Fetching the track's own URL from Node (1.4.0–1.5.7) is what YouTube refused with
+      // 429 on 2026-09-24 while the same track kept coming through yt-dlp.
+      execFileMock.mockImplementation(
+        (
+          _f: string,
+          _a: string[],
+          _o: unknown,
+          cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void
+        ) => setImmediate(() => cb(null, { stdout: '', stderr: '' }))
+      );
+      await youtube.downloadSubtitles('https://www.youtube.com/watch?v=d', 'official', 'en', 'vtt');
+      expect(execFileMock).toHaveBeenCalledTimes(1);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('gives a platform every outcome before it asks, so a refusal reads as a step', async () => {
+      // Vimeo is untouched by the other cases here, so the series cannot pre-exist.
+      const refused = 'platform="vimeo",path="yt_dlp",outcome="rate_limited"';
+      expect(await seriesExists(refused)).toBe(false);
+
+      execFileMock.mockImplementation(
+        (
+          _f: string,
+          _a: string[],
+          _o: unknown,
+          cb: (err: Error | null, result?: { stdout: string; stderr: string }) => void
+        ) => setImmediate(() => cb(null, { stdout: '', stderr: '' }))
+      );
+      await youtube.downloadSubtitles('https://vimeo.com/76979871', 'auto', 'en');
+
+      // A refusal has something to be a step from now: an alert on increase() over a series
+      // born at 1 sees a flat line, which is how the 429 of 2026-09-23 went unreported.
+      expect(await seriesExists(refused)).toBe(true);
+      expect(await captionRequests(refused)).toBe(0);
+    });
+
+    it('counts what it spends on the caption endpoint, and nothing else', async () => {
       const ytDlpOk = 'platform="youtube",path="yt_dlp",outcome="ok"';
+      const ytDlp429 = 'platform="youtube",path="yt_dlp",outcome="rate_limited"';
       const before = {
-        direct: await captionRequests(direct429),
-        ytDlp: await captionRequests(ytDlpOk),
+        ok: await captionRequests(ytDlpOk),
+        refused: await captionRequests(ytDlp429),
       };
 
-      // One request to the endpoint, refused.
-      fetchMock.mockResolvedValue({ ok: false, status: 429, text: () => Promise.resolve('') });
-      await youtube
-        .downloadSubtitles(
-          'https://www.youtube.com/watch?v=x',
-          'official',
-          'en',
-          'vtt',
-          undefined,
-          data
-        )
-        .catch(() => undefined);
-      expect(await captionRequests(direct429)).toBe(before.direct + 1);
-      // The yt-dlp run never happened, so it must not be counted.
-      expect(await captionRequests(ytDlpOk)).toBe(before.ytDlp);
-
       // One yt-dlp run that reached the platform and came back without a track.
-      resetSubtitleRateLimitsForTests();
       execFileMock.mockImplementation(
         (
           _f: string,
@@ -647,79 +520,36 @@ today to pay our respects to MCP, which
         ) => setImmediate(() => cb(null, { stdout: '', stderr: '' }))
       );
       await youtube.downloadSubtitles('https://www.youtube.com/watch?v=p', 'auto', 'en');
-      expect(await captionRequests(ytDlpOk)).toBe(before.ytDlp + 1);
+      expect(await captionRequests(ytDlpOk)).toBe(before.ok + 1);
 
-      // A yt-dlp run the platform refuses: the series that says which path hit the limit.
-      const ytDlp429 = 'platform="youtube",path="yt_dlp",outcome="rate_limited"';
-      const beforeRefused = await captionRequests(ytDlp429);
-      resetSubtitleRateLimitsForTests();
+      // A yt-dlp run the platform refuses.
       mockExecFileFailure('ERROR: HTTP Error 429: Too Many Requests');
       await youtube
         .downloadSubtitles('https://www.youtube.com/watch?v=r', 'auto', 'en')
         .catch(() => undefined);
-      expect(await captionRequests(ytDlp429)).toBe(beforeRefused + 1);
-      expect(await captionRequests(ytDlpOk)).toBe(before.ytDlp + 1);
+      expect(await captionRequests(ytDlp429)).toBe(before.refused + 1);
+
+      // A call the hold turns away never left the server, so it is not a request.
+      await youtube
+        .downloadSubtitles('https://www.youtube.com/watch?v=r2', 'auto', 'en')
+        .catch(() => undefined);
+      expect(await captionRequests(ytDlp429)).toBe(before.refused + 1);
+      expect(await captionRequests(ytDlpOk)).toBe(before.ok + 1);
     });
 
     it('answers the next call for that platform without spending a request', async () => {
-      fetchMock.mockResolvedValue({ ok: false, status: 429, text: () => Promise.resolve('') });
+      mockExecFileFailure('ERROR: HTTP Error 429: Too Many Requests');
 
-      // A 429 on the track URL is the platform's answer for the whole platform: reported
-      // as a rate limit, and without handing the doomed request on to yt-dlp.
       await expect(
-        youtube.downloadSubtitles(
-          'https://www.youtube.com/watch?v=x',
-          'official',
-          'en',
-          'vtt',
-          undefined,
-          data
-        )
+        youtube.downloadSubtitles('https://www.youtube.com/watch?v=x', 'official', 'en', 'vtt')
       ).rejects.toMatchObject({ name: 'YtDlpError', reason: 'rate_limited' });
-      expect(execFileMock).not.toHaveBeenCalled();
-      fetchMock.mockClear();
+      expect(execFileMock).toHaveBeenCalledTimes(1);
 
       // Another spelling of the same platform: the limit is the platform's, not the URL's.
       await expect(
-        youtube.downloadSubtitles('https://youtu.be/y', 'official', 'en', 'vtt', undefined, data)
+        youtube.downloadSubtitles('https://youtu.be/y', 'official', 'en', 'vtt')
       ).rejects.toMatchObject({ name: 'YtDlpError', reason: 'rate_limited' });
-      expect(fetchMock).not.toHaveBeenCalled();
-      expect(execFileMock).not.toHaveBeenCalled();
-    });
-
-    it('asks again once the wait is over, and a download clears the limit', async () => {
-      const t0 = 1_700_000_000_000;
-      const minute = 60 * 1000;
-      const dateSpy = jest.spyOn(Date, 'now').mockReturnValue(t0);
-      const call = () =>
-        youtube.downloadSubtitles(
-          'https://www.youtube.com/watch?v=x',
-          'official',
-          'en',
-          'vtt',
-          undefined,
-          data
-        );
-      const refuse = () =>
-        fetchMock.mockResolvedValue({ ok: false, status: 429, text: () => Promise.resolve('') });
-      const answerCue = () =>
-        fetchMock.mockResolvedValue({ ok: true, status: 200, text: () => Promise.resolve(CUE) });
-
-      refuse();
-      await call().catch(() => undefined);
-
-      dateSpy.mockReturnValue(t0 + 11 * minute);
-      answerCue();
-      await expect(call()).resolves.toContain('WEBVTT');
-
-      // The download cleared the count, so a later 429 waits the base time again and not
-      // twice it: without the clear this call would still be held back at +22 minutes.
-      refuse();
-      await call().catch(() => undefined);
-      dateSpy.mockReturnValue(t0 + 22 * minute);
-      answerCue();
-      await expect(call()).resolves.toContain('WEBVTT');
-      dateSpy.mockRestore();
+      expect(execFileMock).toHaveBeenCalledTimes(1);
     });
 
     it('clears the limit only when yt-dlp brings back a track', async () => {
@@ -767,6 +597,7 @@ today to pay our respects to MCP, which
       await youtube
         .downloadSubtitles('https://www.youtube.com/watch?v=n', 'auto', 'en')
         .catch(() => undefined);
+      expect(await strikes('youtube')).toBe(1);
 
       // A run that finds no file may never have asked the caption endpoint at all.
       dateSpy.mockReturnValue(t0 + 11 * minute);
@@ -775,7 +606,7 @@ today to pay our respects to MCP, which
       );
       await expect(
         youtube.downloadSubtitles('https://www.youtube.com/watch?v=n', 'auto', 'en')
-      ).resolves.toBeNull();
+      ).resolves.toBe('');
 
       mockExecFileFailure('ERROR: HTTP Error 429: Too Many Requests');
       await youtube
@@ -783,6 +614,8 @@ today to pay our respects to MCP, which
         .catch(() => undefined);
       // Second strike, so the wait is 20 minutes: still held 11 minutes later, and being
       // held means no process runs — a cleared count would have let this call through.
+      // The gauge is what the "banned" alert reads: two refusals with no track between.
+      expect(await strikes('youtube')).toBe(2);
       dateSpy.mockReturnValue(t0 + 22 * minute);
       execFileMock.mockClear();
       await expect(
@@ -1217,25 +1050,33 @@ today to pay our respects to MCP, which
       ]);
     });
 
-    it('should return original path when cookies file is writable', async () => {
+    it('should never hand yt-dlp the original cookies file, even a writable one', async () => {
+      // yt-dlp truncates and rewrites the file it is given when it exits. A run killed during
+      // that write emptied the shared file on prod, and every later run refused it.
       const writablePath = join(tmpdir(), 'cookies_writable.txt');
       await writeFile(writablePath, '# Netscape\n', 'utf-8');
 
-      const { path, cleanup } = await ensureWritableCookiesFile(writablePath);
+      const { path, cleanup } = await copyCookiesFile(writablePath);
 
-      expect(path).toBe(writablePath);
+      expect(path).not.toBe(writablePath);
+      await expect(readFile(path, 'utf-8')).resolves.toBe('# Netscape\n');
+      // A signed-in session in a tmpdir that may be shared.
+      expect((await stat(path)).mode & 0o777).toBe(0o600);
       await cleanup();
+      await expect(access(path, constants.F_OK)).rejects.toThrow();
       await expect(access(writablePath, constants.F_OK)).resolves.toBeUndefined();
       await unlink(writablePath).catch(() => {});
     });
 
     it('should copy to temp when cookies file is read-only and cleanup removes temp', async () => {
       const readOnlyPath = join(tmpdir(), 'cookies_readonly.txt');
+      // A failed run of this case leaves the file read-only behind it.
+      await unlink(readOnlyPath).catch(() => {});
       await writeFile(readOnlyPath, '# Netscape\n', 'utf-8');
       const { chmod } = await import('node:fs/promises');
       await chmod(readOnlyPath, 0o444);
 
-      const { path, cleanup } = await ensureWritableCookiesFile(readOnlyPath);
+      const { path, cleanup } = await copyCookiesFile(readOnlyPath);
 
       expect(path).not.toBe(readOnlyPath);
       expect(path).toContain(tmpdir());
@@ -1861,6 +1702,10 @@ today to pay our respects to MCP, which
       expect(classifyYtDlpFailure({ message: 'Command failed', signal: 'SIGTERM' })).toBe(
         'timeout'
       );
+      // ffmpeg is ended with SIGKILL: it does not act on SIGTERM inside a network read.
+      expect(classifyYtDlpFailure({ message: 'Command failed', signal: 'SIGKILL' })).toBe(
+        'timeout'
+      );
     });
 
     it('should prefer the stderr cause over the timeout signal', () => {
@@ -1918,6 +1763,49 @@ today to pay our respects to MCP, which
       });
     });
 
+    it('should leave room for the JSON of a dubbed video', async () => {
+      // One 17-minute video with 21 audio tracks listed every auto-caption language once per
+      // track: 11.7 MB of JSON, and the 10 MB cap killed yt-dlp on it (prod, 2026-09-24).
+      execFileMock.mockImplementation(
+        (
+          _file: string,
+          _args: string[],
+          _options: unknown,
+          callback: (error: Error | null, result?: { stdout: string; stderr: string }) => void
+        ) => callback(null, { stdout: '{"id":"abc"}', stderr: '' })
+      );
+
+      await fetchYtDlpJson('https://www.youtube.com/watch?v=abc');
+
+      const options = execFileMock.mock.calls[0][2] as { maxBuffer: number };
+      expect(options.maxBuffer).toBeGreaterThan(12 * 1024 * 1024);
+    });
+
+    it('should give the JSON run a copy of the cookies, never the file itself', async () => {
+      // The run that emptied the prod cookies file was this one.
+      const original = join(tmpdir(), 'cookies_json_run.txt');
+      await writeFile(original, '# Netscape\n', 'utf-8');
+      process.env.COOKIES_FILE_PATH = original;
+      execFileMock.mockImplementation(
+        (
+          _file: string,
+          _args: string[],
+          _options: unknown,
+          callback: (error: Error | null, result?: { stdout: string; stderr: string }) => void
+        ) => callback(null, { stdout: '{"id":"abc"}', stderr: '' })
+      );
+
+      try {
+        await fetchYtDlpJson('https://www.youtube.com/watch?v=abc');
+        const args = execFileMock.mock.calls[0][1] as string[];
+        expect(args).toContain('--cookies');
+        expect(args[args.indexOf('--cookies') + 1]).not.toBe(original);
+      } finally {
+        delete process.env.COOKIES_FILE_PATH;
+        await unlink(original).catch(() => {});
+      }
+    });
+
     it('should keep returning null from fetchYtDlpJson when the reason is unknown', async () => {
       mockExecFileFailure('ERROR: something we have never seen');
       await expect(fetchYtDlpJson('https://www.youtube.com/watch?v=abc')).resolves.toBeNull();
@@ -1958,6 +1846,35 @@ today to pay our respects to MCP, which
           name: 'YtDlpError',
           reason,
         });
+      }
+    });
+
+    it('should reject a bot check that yt-dlp reports as a warning when YT_DLP_NO_WARNINGS is 1', async () => {
+      process.env.YT_DLP_NO_WARNINGS = '1';
+      // Like yt-dlp: --no-warnings drops the WARNING lines, and the refusal is only there.
+      execFileMock.mockImplementation(
+        (
+          _file: string,
+          args: string[],
+          _options: unknown,
+          callback: (error: Error | null, result?: { stdout: string; stderr: string }) => void
+        ) => {
+          callback(null, {
+            stdout: JSON.stringify({ id: 'x', title: 'youtube video #x', formats: [] }),
+            stderr: args.includes('--no-warnings')
+              ? ''
+              : "WARNING: [youtube] x: Sign in to confirm you're not a bot\nWARNING: No video formats found!",
+          });
+        }
+      );
+      try {
+        await expect(fetchYtDlpJson('https://www.youtube.com/watch?v=x')).rejects.toMatchObject({
+          name: 'YtDlpError',
+          reason: 'bot_check',
+          statusCode: 502,
+        });
+      } finally {
+        delete process.env.YT_DLP_NO_WARNINGS;
       }
     });
 
@@ -2013,6 +1930,13 @@ today to pay our respects to MCP, which
       ).rejects.toMatchObject({ name: 'YtDlpError', reason: 'rate_limited' });
     });
 
+    it('should return null, not an empty text, for a run that failed without a class', async () => {
+      mockExecFileFailure('ERROR: Unable to download video subtitles: HTTP Error 500');
+      await expect(
+        downloadSubtitles('https://www.youtube.com/watch?v=abc', 'auto', 'en')
+      ).resolves.toBeNull();
+    });
+
     it('should never put the command line or stderr in the error message', async () => {
       mockExecFileFailure(botCheck);
       await expect(
@@ -2053,6 +1977,30 @@ today to pay our respects to MCP, which
       }
       delete process.env.YT_DLP_MAX_CONCURRENCY;
       delete process.env.YT_DLP_MAX_QUEUE;
+    });
+
+    it('should not start a frame stage that got its slot after the deadline', async () => {
+      // The frame's budget counts its wait for a slot; a stage dequeued too late would
+      // otherwise run on the time it had before it queued.
+      process.env.YT_DLP_MAX_CONCURRENCY = '1';
+      process.env.YT_DLP_FRAME_TIMEOUT = '1000';
+      let now = 1700000004000;
+      const dateSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+      try {
+        const busy = fetchYtDlpJson(url);
+        await tick();
+        const frame = captureVideoFrame(url, 10).catch((err: unknown) => err);
+        await tick();
+        now += 2000;
+        releases.shift()?.();
+
+        await expect(frame).resolves.toMatchObject({ name: 'YtDlpError', reason: 'timeout' });
+        expect(execFileMock).toHaveBeenCalledTimes(1);
+        await busy;
+      } finally {
+        dateSpy.mockRestore();
+        delete process.env.YT_DLP_FRAME_TIMEOUT;
+      }
     });
 
     it('should run up to the cap, queue the next, and refuse beyond the queue', async () => {
@@ -2154,7 +2102,9 @@ today to pay our respects to MCP, which
           setImmediate(() => cb(null, '', ''));
         }
       );
-      await downloadPlaylistSubtitles('https://www.youtube.com/playlist?list=PLxxx', {});
+      await downloadPlaylistSubtitles('https://www.youtube.com/playlist?list=PLxxx', {
+        lang: 'en',
+      });
       expect(capturedArgs).not.toContain('--ignore-errors');
     });
 
@@ -2176,7 +2126,7 @@ today to pay our respects to MCP, which
         }
       );
       await expect(
-        downloadPlaylistSubtitles('https://www.youtube.com/playlist?list=PLxxx', {})
+        downloadPlaylistSubtitles('https://www.youtube.com/playlist?list=PLxxx', { lang: 'en' })
       ).rejects.toMatchObject({ name: 'YtDlpError', reason: 'private' });
     });
 
@@ -2187,7 +2137,10 @@ today to pay our respects to MCP, which
       );
 
       await expect(
-        downloadPlaylistSubtitles('https://www.youtube.com/playlist?list=PLxxx', { maxItems: 2 })
+        downloadPlaylistSubtitles('https://www.youtube.com/playlist?list=PLxxx', {
+          lang: 'en',
+          maxItems: 2,
+        })
       ).rejects.toMatchObject({ name: 'YtDlpError', reason: 'rate_limited' });
     });
 
@@ -2195,7 +2148,10 @@ today to pay our respects to MCP, which
       noteSubtitlesRateLimited('https://www.youtube.com/watch?v=x');
 
       await expect(
-        downloadPlaylistSubtitles('https://www.youtube.com/playlist?list=PLxxx', { maxItems: 2 })
+        downloadPlaylistSubtitles('https://www.youtube.com/playlist?list=PLxxx', {
+          lang: 'en',
+          maxItems: 2,
+        })
       ).rejects.toMatchObject({ name: 'YtDlpError', reason: 'rate_limited' });
       expect(execFileMock).not.toHaveBeenCalled();
     });
@@ -2206,8 +2162,39 @@ today to pay our respects to MCP, which
       mockExecFileFailure('', 101);
 
       await expect(
-        downloadPlaylistSubtitles('https://www.youtube.com/playlist?list=PLxxx', { maxItems: 2 })
+        downloadPlaylistSubtitles('https://www.youtube.com/playlist?list=PLxxx', {
+          lang: 'en',
+          maxItems: 2,
+        })
       ).resolves.toEqual([]);
+    });
+
+    it('returns what a bounded run wrote before yt-dlp cancelled the queue', async () => {
+      // The handler used to run after `finally` had already removed the temp directory, so
+      // every run that stopped at maxItems answered with nothing.
+      execFileMock.mockImplementation(
+        (
+          _file: string,
+          args: string[],
+          _options: unknown,
+          callback: (error: Error | null, result?: { stdout: string; stderr: string }) => void
+        ) => {
+          const dir = dirname(args[args.indexOf('--output') + 1]);
+          void writeFile(join(dir, 'vid1.en.srt'), '1\n00:00:00,000 --> 00:00:01,000\nhi\n').then(
+            () => {
+              const error = Object.assign(new Error('Command failed: yt-dlp'), { code: 101 });
+              callback(error, { stdout: '', stderr: '' });
+            }
+          );
+        }
+      );
+
+      const results = await downloadPlaylistSubtitles(
+        'https://www.youtube.com/playlist?list=PLxxx',
+        { lang: 'en', maxItems: 1 }
+      );
+
+      expect(results.map((r) => r.videoId)).toEqual(['vid1']);
     });
   });
 
@@ -2334,10 +2321,116 @@ today to pay our respects to MCP, which
         expect(outcome.data.equals(frameBytes)).toBe(true);
       }
       expect(sectionArgs).toContain('--force-keyframes-at-cuts');
+      // yt-dlp's own ffmpeg outlives a yt-dlp killed by the timeout.
+      expect(sectionArgs[sectionArgs.indexOf('--downloader-args') + 1]).toBe(
+        'ffmpeg_i:-rw_timeout 15000000'
+      );
       expect(sectionArgs[sectionArgs.indexOf('--download-sections') + 1]).toBe('*10-12');
       // clip is cleaned up
       await expect(access(clipPath, constants.F_OK)).rejects.toThrow();
       dateSpy.mockRestore();
+    });
+
+    it('should spend one budget across every stage and kill ffmpeg outright', async () => {
+      // Each process used to get the whole timeout, and ffmpeg blocked in a network read
+      // ignored the SIGTERM that ended it: failed frames took up to 1327 s on prod.
+      process.env.YT_DLP_FRAME_TIMEOUT = '1000';
+      let now = 1700000003000;
+      const dateSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+      const calls: Array<{ file: string; args: string[]; options: Record<string, unknown> }> = [];
+
+      execFileMock.mockImplementation(
+        (
+          file: string,
+          args: string[],
+          options: Record<string, unknown>,
+          callback: ExecCallback
+        ) => {
+          calls.push({ file, args, options });
+          if (file === 'yt-dlp') {
+            now += 300;
+            callback(null, { stdout: 'vid123\n212\nhttps://cdn.example/stream.mp4\n', stderr: '' });
+            return;
+          }
+          now += 700; // killed at the deadline
+          callback(Object.assign(new Error('ffmpeg killed'), { code: null, signal: 'SIGKILL' }));
+        }
+      );
+
+      await expect(captureVideoFrame(url, 10)).rejects.toMatchObject({
+        name: 'YtDlpError',
+        reason: 'timeout',
+      });
+
+      // The section download is never started: the budget is gone.
+      expect(calls.map((c) => c.file)).toEqual(['yt-dlp', 'ffmpeg']);
+      expect(calls[0].options.timeout).toBe(1000);
+      const ffmpeg = calls[1];
+      expect(ffmpeg.options.timeout).toBe(700);
+      expect(ffmpeg.options.killSignal).toBe('SIGKILL');
+      expect(ffmpeg.args.slice(0, ffmpeg.args.indexOf('-i'))).toContain('-rw_timeout');
+      dateSpy.mockRestore();
+    });
+
+    it('should answer timeout when the clip read is what used up the budget', async () => {
+      process.env.YT_DLP_FRAME_TIMEOUT = '1000';
+      let now = 1700000005000;
+      const dateSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+      const clipPath = join(tmpdir(), `${urlToSafeBase(url, 'frame_clip')}.mp4`);
+      let ffmpegCalls = 0;
+      execFileMock.mockImplementation(
+        (file: string, args: string[], _options: unknown, callback: ExecCallback) => {
+          if (file === 'yt-dlp' && args.includes('--download-sections')) {
+            void writeFile(clipPath, 'fake clip').then(() =>
+              callback(null, { stdout: '', stderr: '' })
+            );
+            return;
+          }
+          if (file === 'yt-dlp') {
+            callback(null, { stdout: 'vid123\n212\nhttps://cdn.example/stream.mp4\n', stderr: '' });
+            return;
+          }
+          ffmpegCalls += 1;
+          if (ffmpegCalls === 2) now += 1000; // the clip read is killed at the deadline
+          callback(Object.assign(new Error('ffmpeg failed'), { code: null, signal: 'SIGKILL' }));
+        }
+      );
+
+      try {
+        await expect(captureVideoFrame(url, 10)).rejects.toMatchObject({
+          name: 'YtDlpError',
+          reason: 'timeout',
+        });
+        expect(ffmpegCalls).toBe(2);
+      } finally {
+        dateSpy.mockRestore();
+      }
+    });
+
+    it('should set no timeout at all when the frame budget is 0', async () => {
+      process.env.YT_DLP_FRAME_TIMEOUT = '0';
+      const dateSpy = jest.spyOn(Date, 'now').mockReturnValue(1700000006000);
+      const outputPath = join(tmpdir(), `${urlToSafeBase(url, 'frame')}.jpg`);
+      const timeouts: unknown[] = [];
+      execFileMock.mockImplementation(
+        (file: string, _args: string[], options: { timeout?: number }, callback: ExecCallback) => {
+          timeouts.push(options.timeout);
+          if (file === 'yt-dlp') {
+            callback(null, { stdout: 'vid123\n212\nhttps://cdn.example/stream.mp4\n', stderr: '' });
+            return;
+          }
+          void writeFile(outputPath, Buffer.from('jpeg')).then(() =>
+            callback(null, { stdout: '', stderr: '' })
+          );
+        }
+      );
+
+      try {
+        await expect(captureVideoFrame(url, 10)).resolves.toMatchObject({ ok: true });
+        expect(timeouts).toEqual([undefined, undefined]);
+      } finally {
+        dateSpy.mockRestore();
+      }
     });
 
     it('should return capture_failed when all attempts fail', async () => {

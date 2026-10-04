@@ -1,6 +1,7 @@
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import { parseIntFromString } from '../env.js';
+import { runApiSmokeTest } from './api-checks.js';
 import { buildDockerImagesIfNeeded, runCommand } from './docker-utils.js';
 import { buildMcpImageRef, runMcpSmokeTest } from './mcp-smoke.js';
 import { getEnvVar, isFlagSet } from './smoke-env.js';
@@ -8,8 +9,6 @@ import { getEnvVar, isFlagSet } from './smoke-env.js';
 const DEFAULT_IMAGE_NAME = 'artsamsonov/transcriptor-mcp-api';
 const DEFAULT_IMAGE_TAG = 'latest';
 const DEFAULT_PORT = 33000;
-
-const SWAGGER_DOCS_PATH = '/docs';
 
 function buildImageRef(): string {
   const imageFromEnv = process.env.SMOKE_IMAGE_API;
@@ -24,12 +23,6 @@ function buildImageRef(): string {
 }
 
 async function waitForApiReady(baseUrl: string, timeoutMs: number): Promise<void> {
-  const fetchImpl: any = (globalThis as any).fetch;
-
-  if (!fetchImpl) {
-    throw new Error('Global fetch is not available in this Node.js runtime');
-  }
-
   const start = Date.now();
 
   const delays = [500, 1000, 1500, 2000, 2000, 3000, 3000];
@@ -42,8 +35,8 @@ async function waitForApiReady(baseUrl: string, timeoutMs: number): Promise<void
 
     try {
       const healthUrl = `${baseUrl.replace(/\/$/, '')}/health`;
-      const response = await fetchImpl(healthUrl, { method: 'GET' });
-      if (response?.ok) {
+      const response = await fetch(healthUrl);
+      if (response.ok) {
         return;
       }
     } catch {
@@ -54,108 +47,6 @@ async function waitForApiReady(baseUrl: string, timeoutMs: number): Promise<void
   }
 
   throw new Error(`API did not become ready within ${timeoutMs}ms`);
-}
-
-async function checkSwaggerDocs(apiBaseUrl: string): Promise<void> {
-  const fetchImpl: any = (globalThis as any).fetch;
-  if (!fetchImpl) {
-    throw new Error('Global fetch is not available in this Node.js runtime');
-  }
-
-  const response = await fetchImpl(`${apiBaseUrl}${SWAGGER_DOCS_PATH}`, { method: 'GET' });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Swagger docs failed with HTTP ${response.status}: ${text.slice(0, 200)}`);
-  }
-
-  const html = await response.text();
-  if (!html.includes('swagger') && !html.includes('openapi')) {
-    throw new Error(
-      `Swagger docs at ${SWAGGER_DOCS_PATH} did not return expected content (no swagger/openapi in body)`
-    );
-  }
-
-  // eslint-disable-next-line no-console
-  console.log(`[smoke] ${SWAGGER_DOCS_PATH} OK (Swagger UI reachable)`);
-}
-
-async function runApiSmokeTest(apiBaseUrl: string): Promise<void> {
-  const fetchImpl: any = (globalThis as any).fetch;
-  if (!fetchImpl) {
-    throw new Error('Global fetch is not available in this Node.js runtime');
-  }
-
-  await checkSwaggerDocs(apiBaseUrl);
-
-  const videoUrl = getEnvVar('SMOKE_VIDEO_URL', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ');
-  const requestTimeoutMs = parseIntFromString(
-    getEnvVar('SMOKE_API_REQUEST_TIMEOUT_MS', '90000'),
-    90000
-  );
-
-  const hasAbortController = (globalThis as any).AbortController !== undefined;
-
-  const controller = hasAbortController ? new (globalThis as any).AbortController() : null;
-
-  let timer: NodeJS.Timeout | null = null;
-  if (controller !== null) {
-    timer = setTimeout(() => {
-      controller.abort();
-    }, requestTimeoutMs);
-  }
-
-  try {
-    const response = await fetchImpl(`${apiBaseUrl}/subtitles`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify({
-        url: videoUrl,
-        type: 'auto',
-        lang: 'en',
-      }),
-      signal: controller?.signal,
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Smoke request failed with HTTP ${response.status}: ${text}`);
-    }
-
-    const data = (await response.json()) as unknown;
-
-    if (
-      typeof data !== 'object' ||
-      data === null ||
-      typeof (data as { videoId?: unknown }).videoId !== 'string' ||
-      typeof (data as { text?: unknown }).text !== 'string' ||
-      typeof (data as { length?: unknown }).length !== 'number'
-    ) {
-      throw new Error(`Unexpected response shape from /subtitles: ${JSON.stringify(data)}`);
-    }
-
-    const { videoId, text, length } = data as {
-      videoId: string;
-      text: string;
-      length: number;
-    };
-
-    if (!videoId || text.length === 0 || length <= 0) {
-      throw new Error(
-        `Invalid data in /subtitles response: videoId=${videoId}, text.length=${text.length}, length=${length}`
-      );
-    }
-
-    // eslint-disable-next-line no-console
-    console.log(
-      `[smoke] /subtitles OK for videoId=${videoId}, text.length=${text.length}, length=${length}`
-    );
-  } finally {
-    if (timer !== null) {
-      clearTimeout(timer);
-    }
-  }
 }
 
 async function main(): Promise<void> {

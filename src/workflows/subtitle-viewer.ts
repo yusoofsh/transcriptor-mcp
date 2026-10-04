@@ -1,15 +1,52 @@
 import { parseSubtitles } from './subtitles.js';
 export const subtitleViewerUri = 'ui://transcriptor/subtitle-reader-v1.html';
 export const subtitleViewerTool = {
-  name: 'open_subtitle_viewer', title: 'Subtitle reader',
-  description: 'Open a read-only SRT/WebVTT viewer. Desktop hosts can supply the selected file reference; other hosts can use local file selection or pasted text. Content is parsed locally, never uploaded or fetched as a URL by the server.',
-  inputSchema: { type: 'object' as const, properties: { file: { type: 'object', properties: { name: { type: 'string', maxLength: 200 }, resourceUri: { type: 'string', maxLength: 2048 } }, required: ['name', 'resourceUri'], additionalProperties: false } }, additionalProperties: false },
-  annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-  _meta: { ui: { resourceUri: subtitleViewerUri, visibility: ['model', 'app'] }, 'openai/ui': { entrypoints: [{ type: 'file', extensions: ['.srt', '.vtt'] }, { type: 'thread' }] } },
+  name: 'open_subtitle_viewer',
+  title: 'Subtitle reader',
+  description:
+    'Open a read-only SRT/WebVTT viewer. Desktop hosts can supply the selected file reference; other hosts can use local file selection or pasted text. Content is parsed locally, never uploaded or fetched as a URL by the server.',
+  inputSchema: {
+    type: 'object' as const,
+    properties: {
+      file: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', maxLength: 200 },
+          resourceUri: { type: 'string', maxLength: 2048 },
+        },
+        required: ['name', 'resourceUri'],
+        additionalProperties: false,
+      },
+    },
+    additionalProperties: false,
+  },
+  annotations: {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  },
+  _meta: {
+    ui: { resourceUri: subtitleViewerUri, visibility: ['model', 'app'] },
+    'openai/ui': {
+      entrypoints: [{ type: 'file', extensions: ['.srt', '.vtt'] }, { type: 'thread' }],
+    },
+  },
 };
 export function subtitleViewerResource() {
-  return { contents: [{ uri: subtitleViewerUri, mimeType: 'text/html;profile=mcp-app', text: subtitleViewerHtml,
-    _meta: { ui: { csp: { connectDomains: [], resourceDomains: [] } }, 'openai/widgetCSP': { connect_domains: [], resource_domains: [] } } }] };
+  return {
+    contents: [
+      {
+        uri: subtitleViewerUri,
+        mimeType: 'text/html;profile=mcp-app',
+        text: subtitleViewerHtml,
+        _meta: {
+          ui: { csp: { connectDomains: [], resourceDomains: [] } },
+          'openai/widgetCSP': { connect_domains: [], resource_domains: [] },
+        },
+      },
+    ],
+  };
 }
 export const subtitleViewerHtml = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Subtitle reader</title><style>:root{font:15px/1.5 system-ui,sans-serif;color-scheme:light dark;background:Canvas;color:CanvasText}body{margin:0;padding:20px}main{max-width:1050px;margin:auto}h1{font-size:26px}button,input,textarea,select{font:inherit;padding:10px;border:1px solid GrayText;border-radius:8px;background:Canvas;color:CanvasText}textarea{display:block;box-sizing:border-box;width:100%;height:120px}header,.toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.toolbar{margin:14px 0}input[type=search]{flex:1;min-width:150px;max-width:100%;box-sizing:border-box}input[type=file]{max-width:100%;box-sizing:border-box}.grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr);gap:18px}article,aside{border:1px solid GrayText;border-radius:10px;padding:14px;margin:10px 0;min-width:0}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit}.muted{font-size:12px;opacity:.7}#results{max-height:65vh;overflow:auto}button:disabled{opacity:.5}@media(max-width:650px){.grid{grid-template-columns:1fr}body{padding:12px}}</style></head><body><main><header><h1>Subtitle reader</h1><span>Read only · local parsing</span></header><p class="muted">Opening or selecting text does not change the source. Markup is displayed literally.</p><div class="toolbar"><input id="local" aria-label="Select local subtitle file" type="file" accept=".srt,.vtt"><button id="reload" disabled>Reload host file</button></div><textarea id="text" maxlength="1048576" aria-label="Paste SRT or WebVTT" placeholder="Paste SRT or WebVTT when a host file is not available"></textarea><div class="toolbar"><button id="parse">Read subtitles</button><input id="search" type="search" maxlength="300" placeholder="Find words in cues" aria-label="Search subtitle cues"><label>Time<select id="units"><option value="seconds">Seconds</option><option value="milliseconds">Milliseconds</option></select></label></div><p id="status" role="status" aria-live="polite">No file read.</p><div class="grid"><section id="results"></section><aside><h2>Selected cue</h2><pre id="selection">Choose a cue.</pre><button id="share" disabled>Use selected cue in chat</button></aside></div></main><script type="module">
 const parseSubtitles=${String(parseSubtitles)};

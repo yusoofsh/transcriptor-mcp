@@ -1,0 +1,26 @@
+name: Subtitle browser
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Install an isolated browser fixture, not a runtime dependency
+        run: |
+          npm install --prefix /tmp/subtitle-browser --no-audit --no-fund playwright@1.63.0
+          /tmp/subtitle-browser/node_modules/.bin/playwright install --with-deps chromium
+      - run: node scripts/test-subtitle-browser.mjs

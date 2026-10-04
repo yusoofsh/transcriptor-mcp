@@ -1,4 +1,11 @@
 import {
+  subtitleViewerTool,
+  subtitleViewerUri,
+  subtitleViewerResource,
+} from './workflows/subtitle-viewer.js';
+import { workflowSkills } from './workflows/skills.js';
+import { privateResult, forwardMeta } from './workflows/core.js';
+import {
   createMcpHandler,
   Server,
   ProtocolError,
@@ -13,19 +20,19 @@ import { createMcpServer } from './mcp-core.js';
 import { version } from './version.js';
 import { EventError, type EventHub } from './events/core.js';
 
-/** The SDK validates the wire request; existing handlers retain business behavior. */
+/** Validate modern requests once, retaining the original authorized business handlers. */
 export function createModernHandler(events?: EventHub, logger?: FastifyBaseLogger) {
   async function delegated<T>(read: (client: Client) => Promise<T>): Promise<T> {
-    const legacy = createMcpServer({ logger });
-    const client = new Client({ name: 'transcriptor-compatibility', version });
-    const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+    const source = createMcpServer({ logger }),
+      client = new Client({ name: 'transcriptor-compatibility', version });
+    const [a, b] = InMemoryTransport.createLinkedPair();
     try {
-      await legacy.connect(serverTransport);
-      await client.connect(clientTransport);
+      await source.connect(a);
+      await client.connect(b);
       return await read(client);
     } finally {
       await client.close();
-      await legacy.close();
+      await source.close();
     }
   }
   return createMcpHandler(
@@ -34,6 +41,7 @@ export function createModernHandler(events?: EventHub, logger?: FastifyBaseLogge
         { name: 'transcriptor-mcp', version },
         {
           capabilities: {
+            extensions: { 'io.modelcontextprotocol/skills': {} },
             tools: {},
             resources: {},
             prompts: {},
@@ -41,50 +49,168 @@ export function createModernHandler(events?: EventHub, logger?: FastifyBaseLogge
           },
         }
       );
-      // The two SDK versions model JSON Schema differently. Both wire ends validate it.
-      server.setRequestHandler('tools/list', async (request, context) => ({
-        ...((await delegated((client) =>
-          client.listTools(request.params, { signal: context.mcpReq.signal })
-        )) as unknown as ListToolsResult),
+      server.setRequestHandler(
+        'skills/list',
+        {
+          params: z.object({ cursor: z.string().optional() }).strict(),
+          result: z.object({}).passthrough(),
+        },
+        (params) => {
+          try {
+            return {
+              ...privateResult(workflowSkills.list(params.cursor), 30000),
+              resultType: 'complete',
+            };
+          } catch {
+            throw new ProtocolError(-32602, 'Invalid skills cursor');
+          }
+        }
+      );
+      server.setRequestHandler(
+        'skills/get',
+        {
+          params: z.object({ uri: z.string().max(300) }).strict(),
+          result: z.object({}).passthrough(),
+        },
+        (params) => {
+          try {
+            return {
+              ...privateResult(workflowSkills.get(params.uri), 30000),
+              resultType: 'complete',
+            };
+          } catch {
+            throw new ProtocolError(-32602, 'Unknown skill');
+          }
+        }
+      );
+      server.setRequestHandler('tools/list', async (request, ctx) => {
+        const result = await delegated((c) =>
+          c.listTools(
+            { ...request.params, _meta: forwardMeta(request.params?._meta, ctx.mcpReq._meta) },
+            { signal: ctx.mcpReq.signal }
+          )
+        );
+        return {
+          ...result,
+          tools: [...result.tools, subtitleViewerTool] as unknown as ListToolsResult['tools'],
+          ttlMs: 0,
+          cacheScope: 'private',
+          resultType: 'complete',
+        };
+      });
+      server.setRequestHandler('tools/call', async (request, ctx) => {
+        if (request.params.name === subtitleViewerTool.name) {
+          const args = z
+            .object({
+              file: z
+                .object({
+                  name: z
+                    .string()
+                    .max(200)
+                    .regex(/\.(srt|vtt)$/i),
+                  resourceUri: z.string().trim().min(1).max(2048),
+                })
+                .strict()
+                .optional(),
+            })
+            .strict()
+            .parse(request.params.arguments ?? {});
+          return {
+            resultType: 'complete',
+            content: [
+              {
+                type: 'text',
+                text: 'Read-only subtitle viewer. The host reads file contents only after an explicit action.',
+              },
+            ],
+            structuredContent: args,
+          };
+        }
+        return {
+          ...((await delegated((c) =>
+            c.callTool(
+              { ...request.params, _meta: forwardMeta(request.params._meta, ctx.mcpReq._meta) },
+              undefined,
+              { signal: ctx.mcpReq.signal }
+            )
+          )) as unknown as CallToolResult),
+          resultType: 'complete',
+        };
+      });
+      server.setRequestHandler('resources/list', async (request, ctx) => {
+        const result = await delegated((c) =>
+          c.listResources(
+            { ...request.params, _meta: forwardMeta(request.params?._meta, ctx.mcpReq._meta) },
+            { signal: ctx.mcpReq.signal }
+          )
+        );
+        return {
+          ...result,
+          resources: [
+            ...result.resources,
+            {
+              name: 'Subtitle reader',
+              uri: subtitleViewerUri,
+              mimeType: 'text/html;profile=mcp-app',
+            },
+          ],
+          ttlMs: 0,
+          cacheScope: 'private',
+          resultType: 'complete',
+        };
+      });
+      server.setRequestHandler('resources/templates/list', async (request, ctx) => ({
+        ...(await delegated((c) =>
+          c.listResourceTemplates(
+            { ...request.params, _meta: forwardMeta(request.params?._meta, ctx.mcpReq._meta) },
+            { signal: ctx.mcpReq.signal }
+          )
+        )),
+        ttlMs: 0,
+        cacheScope: 'private',
         resultType: 'complete',
       }));
-      server.setRequestHandler('tools/call', async (request, context) => ({
-        ...((await delegated((client) =>
-          client.callTool(request.params, undefined, { signal: context.mcpReq.signal })
-        )) as unknown as CallToolResult),
+      server.setRequestHandler('resources/read', async (request, ctx) => {
+        if (request.params.uri === subtitleViewerUri)
+          return {
+            ...subtitleViewerResource(),
+            ttlMs: 30000,
+            cacheScope: 'private',
+            resultType: 'complete',
+          };
+        return {
+          ...(await delegated((c) =>
+            c.readResource(
+              { ...request.params, _meta: forwardMeta(request.params._meta, ctx.mcpReq._meta) },
+              { signal: ctx.mcpReq.signal }
+            )
+          )),
+          ttlMs: 0,
+          cacheScope: 'private',
+          resultType: 'complete',
+        };
+      });
+      server.setRequestHandler('prompts/list', async (request, ctx) => ({
+        ...(await delegated((c) =>
+          c.listPrompts(
+            { ...request.params, _meta: forwardMeta(request.params?._meta, ctx.mcpReq._meta) },
+            { signal: ctx.mcpReq.signal }
+          )
+        )),
+        ttlMs: 0,
+        cacheScope: 'private',
         resultType: 'complete',
       }));
-      server.setRequestHandler('resources/list', async (request, context) => ({
-        ...(await delegated((client) =>
-          client.listResources(request.params, { signal: context.mcpReq.signal })
+      server.setRequestHandler('prompts/get', async (request, ctx) => ({
+        ...(await delegated((c) =>
+          c.getPrompt(
+            { ...request.params, _meta: forwardMeta(request.params._meta, ctx.mcpReq._meta) },
+            { signal: ctx.mcpReq.signal }
+          )
         )),
         resultType: 'complete',
       }));
-      server.setRequestHandler('resources/templates/list', async (request, context) => ({
-        ...(await delegated((client) =>
-          client.listResourceTemplates(request.params, { signal: context.mcpReq.signal })
-        )),
-        resultType: 'complete',
-      }));
-      server.setRequestHandler('resources/read', async (request, context) => ({
-        ...(await delegated((client) =>
-          client.readResource(request.params, { signal: context.mcpReq.signal })
-        )),
-        resultType: 'complete',
-      }));
-      server.setRequestHandler('prompts/list', async (request, context) => ({
-        ...(await delegated((client) =>
-          client.listPrompts(request.params, { signal: context.mcpReq.signal })
-        )),
-        resultType: 'complete',
-      }));
-      server.setRequestHandler('prompts/get', async (request, context) => ({
-        ...(await delegated((client) =>
-          client.getPrompt(request.params, { signal: context.mcpReq.signal })
-        )),
-        resultType: 'complete',
-      }));
-      if (events) {
+      if (events)
         for (const method of ['events/list', 'events/subscribe', 'events/unsubscribe']) {
           server.setRequestHandler(
             method,
@@ -94,13 +220,10 @@ export function createModernHandler(events?: EventHub, logger?: FastifyBaseLogge
             },
             async (params) => {
               try {
-                const result = await events.handle(
-                  method,
-                  params,
-                  process.env.MCP_EVENTS_PRINCIPAL!
-                );
                 return {
-                  ...z.record(z.string(), z.unknown()).parse(result),
+                  ...z
+                    .record(z.string(), z.unknown())
+                    .parse(await events.handle(method, params, process.env.MCP_EVENTS_PRINCIPAL!)),
                   resultType: 'complete' as const,
                 };
               } catch (error) {
@@ -115,7 +238,6 @@ export function createModernHandler(events?: EventHub, logger?: FastifyBaseLogge
             }
           );
         }
-      }
       return server;
     },
     { legacy: 'reject' }

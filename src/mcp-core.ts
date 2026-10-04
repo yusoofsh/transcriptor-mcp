@@ -1,3 +1,4 @@
+import { registerWorkflowResources } from './workflows/resources.js';
 import {
   registerAppResource,
   registerAppTool,
@@ -553,6 +554,7 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
     name: 'transcriptor-mcp',
     version,
   });
+  registerWorkflowResources(server);
 
   /**
    * Get video transcript

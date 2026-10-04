@@ -104,6 +104,32 @@ afterAll(async () => {
 });
 
 describe('POST /mcp', () => {
+  it('serves modern tools/list without a legacy initialize or session', async () => {
+    const response = await postMcp(
+      {
+        jsonrpc: '2.0',
+        id: 100,
+        method: 'tools/list',
+        params: {
+          _meta: {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientCapabilities': {},
+          },
+        },
+      },
+      { 'MCP-Protocol-Version': '2026-07-28', 'MCP-Method': 'tools/list' }
+    );
+    expect(response.status).toBe(200);
+    const body = await readMcpBody(response);
+    expect(body.result?.resultType).toBe('complete');
+    expect(body.result?._meta?.['io.modelcontextprotocol/serverInfo']?.name).toBe(
+      'transcriptor-mcp'
+    );
+    expect(
+      body.result?.tools?.some((tool: { name: string }) => tool.name === 'get_transcript')
+    ).toBe(true);
+  });
+
   it('answers initialize without issuing a session id', async () => {
     const response = await postMcp(initializeBody());
 

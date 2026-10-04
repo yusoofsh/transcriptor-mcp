@@ -2,6 +2,7 @@ import type { FastifyBaseLogger } from 'fastify';
 import { parseIntEnv } from './env.js';
 import { setWhisperBackgroundJobsActive } from './metrics.js';
 import { getWhisperConfig, transcribeWithWhisper, type WhisperResponseFormat } from './whisper.js';
+import { transcriptCompleted } from './events/transcriptor.js';
 
 const inflightJobs = new Map<string, Promise<string | null>>();
 
@@ -48,7 +49,14 @@ export function startOrReuseWhisperJob(
   const bgTimeoutMs = getWhisperBackgroundTimeoutMs();
   const promise = (async (): Promise<string | null> => {
     try {
-      return await transcribeWithWhisper(url, lang, format, logger, bgTimeoutMs);
+      const result = await transcribeWithWhisper(url, lang, format, logger, bgTimeoutMs);
+      if (result !== null) {
+        // Event delivery must not turn a completed transcription into a failed job.
+        await transcriptCompleted(url, lang, format).catch(() =>
+          logger?.warn('MCP transcript event queue failed')
+        );
+      }
+      return result;
     } finally {
       inflightJobs.delete(key);
       syncGauge();

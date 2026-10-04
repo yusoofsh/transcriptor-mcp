@@ -5,6 +5,9 @@
  * between requests, so any instance can answer any request. Authentication is NOT handled
  * here — the deployment terminates OAuth at the gateway in front of this listener.
  */
+import { isLegacyRequest } from '@modelcontextprotocol/server';
+import { toNodeHandler, toWebRequest } from '@modelcontextprotocol/node';
+import { createModernHandler } from './modern-bridge.js';
 import Fastify, {
   type FastifyError,
   type FastifyInstance,
@@ -21,6 +24,7 @@ import { setupLifecycle } from './lifecycle.js';
 import { checkYtDlpAtStartup, checkYtDlpVersion } from './yt-dlp-check.js';
 import { startCanary } from './canary.js';
 import { close as closeCache } from './cache.js';
+import { getTranscriptEventHub } from './events/transcriptor.js';
 
 /** Canonical Streamable HTTP endpoint. Clients POST JSON-RPC here. */
 export const MCP_PATH = '/mcp';
@@ -101,7 +105,19 @@ export function buildMcpHttpApp(opts?: BuildMcpHttpAppOptions): FastifyInstance 
     return reply.header('Content-Type', 'text/plain; charset=utf-8').send(metrics);
   });
 
+  const events = getTranscriptEventHub();
+  const modern = createModernHandler(events, app.log);
+  const modernNode = toNodeHandler(modern);
+  app.addHook('onClose', () => modern.close());
   app.post(MCP_PATH, async (request, reply) => {
+    const webRequest = await toWebRequest(request.raw, request.body);
+    if (!(await isLegacyRequest(webRequest, request.body))) {
+      reply.header('Cache-Control', 'no-store');
+      reply.raw.setHeader('Cache-Control', 'no-store');
+      reply.hijack();
+      await modernNode(request.raw, reply.raw, request.body);
+      return;
+    }
     // The transport writes status, headers and body straight to the raw response
     // (including SSE frames), so Fastify must stop managing this reply.
     reply.hijack();
@@ -140,6 +156,15 @@ export function buildMcpHttpApp(opts?: BuildMcpHttpAppOptions): FastifyInstance 
       }
       dispose();
     }
+  });
+
+  const eventTimer = setInterval(() => {
+    void events?.flush().catch(() => app.log.warn('MCP event delivery failed'));
+  }, 1000);
+  eventTimer.unref();
+  app.addHook('onClose', () => {
+    clearInterval(eventTimer);
+    return Promise.resolve();
   });
 
   // The transport does NOT reject GET/DELETE in stateless mode — a GET would open an SSE

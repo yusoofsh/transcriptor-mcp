@@ -3,18 +3,20 @@ import { EventError, type EventHub } from './events/core.js';
 
 jest.mock('./mcp-core.js', () => ({
   createMcpServer: () => {
-    const { McpServer } = jest.requireActual('@modelcontextprotocol/sdk/server/mcp.js');
+    const { McpServer } = jest.requireActual<
+      typeof import('@modelcontextprotocol/sdk/server/mcp.js')
+    >('@modelcontextprotocol/sdk/server/mcp.js');
     const server = new McpServer({ name: 'fixture', version: '1' });
     server.registerTool(
       'fixture_read',
       { inputSchema: {}, _meta: { ui: { resourceUri: 'ui://fixture/view.html' } } },
-      async () => ({ content: [{ type: 'text', text: 'read' }], _meta: { fixture: 'retained' } })
+      () => ({ content: [{ type: 'text', text: 'read' }], _meta: { fixture: 'retained' } })
     );
     server.registerResource(
       'fixture',
       'ui://fixture/view.html',
       { mimeType: 'text/html;profile=mcp-app' },
-      async () => ({
+      () => ({
         contents: [
           {
             uri: 'ui://fixture/view.html',
@@ -25,7 +27,7 @@ jest.mock('./mcp-core.js', () => ({
         ],
       })
     );
-    server.registerPrompt('fixture_prompt', {}, async () => ({
+    server.registerPrompt('fixture_prompt', {}, () => ({
       messages: [{ role: 'user', content: { type: 'text', text: 'fixture prompt' } }],
     }));
     return server;

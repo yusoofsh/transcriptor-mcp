@@ -27,9 +27,21 @@ jest.mock('node:child_process', () => ({
   execFile: jest.fn(),
 }));
 
+// Only to see what reaches Sentry; nothing initialises Sentry here, so nothing is sent.
+jest.mock('@sentry/node', () => ({
+  ...jest.requireActual<typeof import('@sentry/node')>('@sentry/node'),
+  captureException: jest.fn(),
+}));
+
 import { execFile } from 'node:child_process';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import * as Sentry from '@sentry/node';
+import type { FastifyBaseLogger } from 'fastify';
+import pino from 'pino';
+import { UNEXPECTED_ERROR_MESSAGE, YtDlpError } from './errors.js';
 import { buildMcpHttpApp } from './mcp-http.js';
 import { createLoggerWithSentryBreadcrumbs } from './logger-sentry-breadcrumbs.js';
+import * as whisperJobs from './whisper-jobs.js';
 
 const MCP_ACCEPT = 'application/json, text/event-stream';
 
@@ -188,6 +200,49 @@ describe('tools/call', () => {
       .find((args) => args.includes('--sub-lang'));
     expect(subArgs?.[subArgs.indexOf('--sub-lang') + 1]).toBe('en_US');
   });
+
+  it('does not start speech-to-text for get_transcript without lang when YT_DLP_NO_WARNINGS=1 hides a bot check', async () => {
+    process.env.YT_DLP_NO_WARNINGS = '1';
+    process.env.WHISPER_MODE = 'local';
+    const whisperSpy = jest
+      .spyOn(whisperJobs, 'startOrReuseWhisperJob')
+      .mockResolvedValue(null as never);
+    const execFileMock = execFile as unknown as jest.Mock;
+    execFileMock.mockReset();
+    // Like yt-dlp with --ignore-no-formats-error: exit 0, a stub without formats, and the
+    // refusal only in a WARNING line, which --no-warnings drops.
+    execFileMock.mockImplementation(
+      (_file: string, args: string[], _options: unknown, callback: (e: null, r: object) => void) =>
+        callback(null, {
+          stdout: JSON.stringify({ id: 'x', title: 'youtube video #x', formats: [] }),
+          stderr: args.includes('--no-warnings')
+            ? ''
+            : "WARNING: [youtube] x: Sign in to confirm you're not a bot\nWARNING: No video formats found!",
+        })
+    );
+
+    try {
+      const response = await postMcp({
+        jsonrpc: '2.0',
+        id: 6,
+        method: 'tools/call',
+        params: {
+          name: 'get_transcript',
+          arguments: { url: 'https://www.youtube.com/watch?v=noWarnBot01' },
+        },
+      });
+
+      const body = await readMcpBody(response);
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.content?.[0]?.text).toBe(new YtDlpError('bot_check').message);
+      expect(whisperSpy).not.toHaveBeenCalled();
+      expect(execFileMock).toHaveBeenCalledTimes(1);
+    } finally {
+      delete process.env.YT_DLP_NO_WARNINGS;
+      delete process.env.WHISPER_MODE;
+      whisperSpy.mockRestore();
+    }
+  });
 });
 
 describe('GET and DELETE /mcp', () => {
@@ -231,5 +286,70 @@ describe('operational endpoints', () => {
     expect(response.status).toBe(404);
     const body = await readMcpBody(response);
     expect(body.error?.code).toBe(-32601);
+  });
+});
+
+describe('unplanned errors', () => {
+  const PATH_ERROR = "ENOENT: no such file or directory, open '/app/CHANGELOG.md'";
+
+  // A fresh app whose warn and error lines land in `lines`, as pino writes them.
+  function appWithLogLines() {
+    const lines: Array<Record<string, unknown>> = [];
+    const local = buildMcpHttpApp({
+      loggerInstance: pino(
+        { level: 'warn' },
+        { write: (line: string) => lines.push(JSON.parse(line)) }
+      ) as FastifyBaseLogger,
+    });
+    return { local, lines };
+  }
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+    jest.clearAllMocks();
+  });
+
+  it('answers a 5xx from the error handler with the generic text, not its message', async () => {
+    const { local, lines } = appWithLogLines();
+    local.get('/boom', () => {
+      throw new Error(PATH_ERROR);
+    });
+
+    const response = await local.inject({ method: 'GET', url: '/boom' });
+    await local.close();
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json().error.message).toBe(UNEXPECTED_ERROR_MESSAGE);
+    // The operator still gets the real error, in the log and in Sentry.
+    expect(lines).toContainEqual(
+      expect.objectContaining({ level: 50, err: expect.objectContaining({ message: PATH_ERROR }) })
+    );
+    expect(Sentry.captureException).toHaveBeenCalledWith(
+      expect.objectContaining({ message: PATH_ERROR })
+    );
+  });
+
+  it('answers a failed transport with the generic text, not its message', async () => {
+    jest
+      .spyOn(StreamableHTTPServerTransport.prototype, 'handleRequest')
+      .mockRejectedValue(new Error(PATH_ERROR));
+    const { local, lines } = appWithLogLines();
+
+    const response = await local.inject({
+      method: 'POST',
+      url: '/mcp',
+      payload: initializeBody(),
+      headers: { 'content-type': 'application/json', accept: MCP_ACCEPT },
+    });
+    await local.close();
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json().error.message).toBe(UNEXPECTED_ERROR_MESSAGE);
+    expect(lines).toContainEqual(
+      expect.objectContaining({ level: 50, err: expect.objectContaining({ message: PATH_ERROR }) })
+    );
+    expect(Sentry.captureException).toHaveBeenCalledWith(
+      expect.objectContaining({ message: PATH_ERROR })
+    );
   });
 });

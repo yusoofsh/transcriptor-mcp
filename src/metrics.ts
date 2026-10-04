@@ -68,24 +68,26 @@ export const subtitlesExtractionFailuresTotal = new Counter({
 });
 
 /**
- * Requests this server makes to a platform's caption endpoint, split by the path that made
- * them. The 429 that takes subtitles down for a day is a budget on exactly these requests,
- * and the budget is not documented anywhere: counting them is the only way to learn how
- * many fit in a day, and whether the two paths are counted against the same one.
- * `outcome=error` includes a yt-dlp run that failed before it reached the endpoint.
+ * Requests this server makes to a platform's caption endpoint. The 429 that takes subtitles
+ * down for a day is a budget on exactly these requests, and the budget is not documented
+ * anywhere: counting them is the only way to learn how many fit in a day. `path` is always
+ * `yt_dlp` since 1.5.8 and stays so the series continue. `outcome=error` includes a yt-dlp
+ * run that failed before it reached the endpoint.
  */
 export const subtitleRequestsTotal = new Counter({
   name: 'subtitle_requests_total',
-  help: 'Requests to a platform caption endpoint, by path (direct fetch or yt-dlp) and outcome',
+  help: 'Requests to a platform caption endpoint, by outcome; path is yt_dlp (the direct fetch went in 1.5.8)',
   labelNames: ['platform', 'path', 'outcome'],
   registers: [register],
 });
 
 /**
- * Tracks that auto-discovery listed but never asked for, counted when it gave up with
- * nothing. The ladder is capped to keep the platform's caption budget for calls that need
- * it, and this is the upper bound on what that cap costs: every one of these is a track
- * that might have answered. Read it against `subtitles_extraction_failures_total`.
+ * Candidate tracks that auto-discovery never asked for (with a `type`, only tracks of that
+ * type), counted whenever it answers with the track list instead of a transcript (ADR 006:
+ * one track request at most). Every one of these is a track the caller now has to name.
+ * Read it against the `not_found` outcome of `get_transcript` in the per-call log line:
+ * `subtitles_extraction_failures_total` counts a `no_subtitles` failure only when
+ * speech-to-text actually ran.
  */
 export const subtitleTracksUntriedTotal = new Counter({
   name: 'subtitle_tracks_untried_total',
@@ -172,10 +174,13 @@ export const canaryLastSuccessTimestampSeconds = new Gauge({
   registers: [register],
 });
 
-// Bounded ring buffer for failed subtitles URLs (max 100)
-const FAILURES_BUFFER_SIZE = 100;
-const failuresBuffer: Array<{ url: string; timestamp: string }> = [];
-let failuresTotalCount = 0;
+// Set by subtitle-rate-limit.ts; the alert on it is `>= 2`.
+export const subtitleRateLimitStrikes = new Gauge({
+  name: 'subtitle_rate_limit_strikes',
+  help: '429s in a row from a platform caption endpoint with no track in between; 0 once a track arrives, and after a restart. 2 or more: this address is banned',
+  labelNames: ['platform'],
+  registers: [register],
+});
 
 export function recordRequest(
   method: string,
@@ -206,26 +211,39 @@ export function recordCacheMiss(kind: CacheKeyType): void {
   cacheMissesTotal.inc({ kind });
 }
 
-export function recordSubtitlesFailure(url: string, reason: string): void {
+export function recordSubtitlesFailure(reason: string): void {
   subtitlesExtractionFailuresTotal.inc({ reason });
-  failuresTotalCount += 1;
-  const entry = { url, timestamp: new Date().toISOString() };
-  if (failuresBuffer.length >= FAILURES_BUFFER_SIZE) {
-    failuresBuffer.shift();
-  }
-  failuresBuffer.push(entry);
 }
 
 export function recordUntriedTracks(platform: string, count: number): void {
   if (count > 0) subtitleTracksUntriedTotal.inc({ platform }, count);
 }
 
+const SUBTITLE_OUTCOMES = ['ok', 'rate_limited', 'error'] as const;
+
+/**
+ * Gives a platform all three series at zero before its first request goes out. A counter
+ * that first appears already holding the value it was incremented to leaves `increase()`
+ * nothing to diff against, so the first 429 after a restart produces no step and an alert
+ * built on it stays silent — which is the one moment the alert exists for. Measured on
+ * 2026-09-23: a refusal at 15:00 UTC raised the series from nothing straight to 1, and the
+ * rule saw a flat line.
+ */
+export function primeSubtitleRequests(platform: string): void {
+  for (const outcome of SUBTITLE_OUTCOMES) {
+    subtitleRequestsTotal.inc({ platform, path: 'yt_dlp', outcome }, 0);
+  }
+}
+
 export function recordSubtitleRequest(
   platform: string,
-  path: 'direct' | 'yt_dlp',
   outcome: 'ok' | 'rate_limited' | 'error'
 ): void {
-  subtitleRequestsTotal.inc({ platform, path, outcome });
+  subtitleRequestsTotal.inc({ platform, path: 'yt_dlp', outcome });
+}
+
+export function setSubtitleRateLimitStrikes(platform: string, strikes: number): void {
+  subtitleRateLimitStrikes.set({ platform }, strikes);
 }
 
 export function recordWhisperRequest(mode: 'local' | 'api'): void {
@@ -234,16 +252,6 @@ export function recordWhisperRequest(mode: 'local' | 'api'): void {
 
 export function setWhisperBackgroundJobsActive(count: number): void {
   whisperBackgroundJobsActive.set(count);
-}
-
-export function getFailedSubtitlesUrls(): {
-  failures: Array<{ url: string; timestamp: string }>;
-  total: number;
-} {
-  return {
-    failures: [...failuresBuffer],
-    total: failuresTotalCount,
-  };
 }
 
 export function setYtDlpVersionInfo(installed: string | null, outdated: boolean): void {

@@ -1,8 +1,7 @@
 import { execFile, type ExecFileException, type ExecFileOptions } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { promisify } from 'node:util';
-import { copyFile, readFile, stat, unlink } from 'node:fs/promises';
-import { constants } from 'node:fs';
+import { readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { FastifyBaseLogger } from 'fastify';
@@ -15,7 +14,7 @@ import {
   YtDlpError,
   type YtDlpFailureReason,
 } from './errors.js';
-import { recordSubtitleRequest, setYtDlpProcessGauges } from './metrics.js';
+import { primeSubtitleRequests, recordSubtitleRequest, setYtDlpProcessGauges } from './metrics.js';
 import { extractPlatformFromUrl } from './platform.js';
 import {
   assertSubtitlesNotRateLimited,
@@ -48,7 +47,9 @@ function syncProcessGauges(): void {
  * that fans out, and about keeping the wait for a queued call bounded.
  *
  * `timeout` and `maxBuffer` are passed through untouched — execFile only starts its
- * timer at spawn, so waiting in the queue never eats into a call's own budget.
+ * timer at spawn, so waiting in the queue never eats into a call's own budget. A
+ * `deadline` is the exception, for a call that shares one budget across its processes:
+ * the timeout is what is left when the process starts, and with nothing left it never does.
  *
  * ponytail: one cap shared by both binaries; split per binary only if frame capture
  * ever starves transcripts.
@@ -56,7 +57,7 @@ function syncProcessGauges(): void {
 async function execFileAsync(
   file: string,
   args: string[],
-  options: Omit<ExecFileOptions, 'encoding'>
+  { deadline, ...options }: Omit<ExecFileOptions, 'encoding'> & { deadline?: number }
 ): Promise<{ stdout: string; stderr: string }> {
   const max = parseIntEnv('YT_DLP_MAX_CONCURRENCY', 4);
   if (max > 0 && activeProcesses >= max) {
@@ -73,6 +74,11 @@ async function execFileAsync(
   syncProcessGauges();
 
   try {
+    if (deadline !== undefined) {
+      const left = deadline - Date.now();
+      if (left <= 0) throw new YtDlpError('timeout');
+      options = { ...options, timeout: left };
+    }
     return await execFileRaw(file, args, options);
   } finally {
     const next = processWaiters.shift();
@@ -152,13 +158,13 @@ export function classifyYtDlpFailure(d: {
   for (const [reason, pattern] of YT_DLP_FAILURE_PATTERNS) {
     if (pattern.test(haystack)) return reason;
   }
-  return d.signal === 'SIGTERM' ? 'timeout' : 'unknown';
+  return d.signal === 'SIGTERM' || d.signal === 'SIGKILL' ? 'timeout' : 'unknown';
 }
 
 /**
  * Turns an infrastructure-class failure into a typed error so it stops being
  * reported as "no subtitles". Benign classes return, keeping the caller's
- * existing null semantics (auto-discovery fan-out, Whisper leg).
+ * existing null semantics (auto-discovery's list answer, Whisper leg).
  */
 function rethrowInfra(error: unknown): void {
   if (error instanceof HttpError) throw error;
@@ -169,9 +175,9 @@ function rethrowInfra(error: unknown): void {
 }
 
 /**
- * One place to notice a platform said 429, whichever of the two caption paths said it:
- * the track's own URL throws a typed error, yt-dlp fails a process. Returns whether it was
- * one, so the caller can label the request it just spent without classifying twice.
+ * One place to notice a platform said 429: yt-dlp failed a process with it in stderr, or a
+ * refusal was already classified. Returns whether it was one, so the caller can label the
+ * request it just spent without classifying twice.
  */
 function noteIfRateLimited(url: string, error: unknown): boolean {
   const reason =
@@ -308,11 +314,6 @@ export type VideoInfo = {
   thumbnails: Array<{ url: string; width?: number; height?: number; id?: string }> | null;
 };
 
-export type AvailableSubtitles = {
-  official: string[];
-  auto: string[];
-};
-
 /**
  * Extracts YouTube video ID from a URL.
  * Used as a fallback for display/logging when yt-dlp does not return an id.
@@ -393,7 +394,9 @@ async function runYtDlpAndExtractSubtitles(
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     const subtitleFile = await findSubtitleFile(outputPath, tempDir, subFormat, logger);
-    return await readAndReturnSubtitleIfValid(subtitleFile);
+    // '' is a run that went through and brought no text; a failed run returns null below.
+    // Only '' may be remembered as "no text" (#60): a network error must not answer for an hour.
+    return (await readAndReturnSubtitleIfValid(subtitleFile)) ?? '';
   } catch (error: unknown) {
     if (error instanceof HttpError) throw error;
     logger?.error(
@@ -420,44 +423,31 @@ async function runYtDlpAndExtractSubtitles(
 }
 
 /**
- * Downloads subtitles using yt-dlp
+ * Downloads subtitles using yt-dlp — only yt-dlp, with the server's cookies and its browser
+ * impersonation. Fetching a listed track's own URL from Node (1.4.0–1.5.7, 0.2 s against a
+ * 4–7 s run) is what YouTube refused with 429 seven times on 2026-09-24 while the same
+ * track kept coming through yt-dlp.
  * @param url - Video URL (any supported platform)
  * @param type - subtitle type: 'official' or 'auto'
  * @param lang - subtitle language (e.g., 'en', 'ru')
  * @param format - subtitle format: srt, vtt, ass, lrc (default from YT_DLP_SUB_FORMAT or srt)
  * @param logger - Fastify logger instance for structured logging
+ * @returns the text; '' when the run went through with no text; null when the run failed
  */
 export async function downloadSubtitles(
   url: string,
   type: 'official' | 'auto' = 'auto',
   lang: string = 'en',
   format?: SubtitleFormat | null,
-  logger?: FastifyBaseLogger,
-  /** The JSON this track was listed in; with it the track is fetched without yt-dlp. */
-  preFetchedData?: YtDlpVideoInfo | null
+  logger?: FastifyBaseLogger
 ): Promise<string | null> {
   const subFormat = resolveSubtitleFormat(format);
   // Asking a platform that just answered 429 spends the quota that keeps it saying 429.
   assertSubtitlesNotRateLimited(url);
   const platform = extractPlatformFromUrl(url);
-  let direct: string | null;
-  try {
-    direct = await downloadSubtitleTrackDirect(
-      preFetchedData,
-      type,
-      lang,
-      subFormat,
-      logger,
-      platform
-    );
-  } catch (error) {
-    noteIfRateLimited(url, error);
-    throw error;
-  }
-  if (direct) {
-    clearSubtitlesRateLimit(url);
-    return direct;
-  }
+  // Before the request, not after it: the series have to exist for the increment to read
+  // as a step rather than as a series being born.
+  primeSubtitleRequests(platform);
   const tempDir = tmpdir();
   const outputPath = join(tempDir, urlToSafeBase(url, 'subtitles'));
   const { jsRuntimes, remoteComponents, cookiesFilePathFromEnv } = getYtDlpEnv();
@@ -465,7 +455,7 @@ export async function downloadSubtitles(
   let cookiesPathToUse = cookiesFilePathFromEnv;
   let cookiesCleanup: (() => Promise<void>) | undefined;
   if (cookiesFilePathFromEnv) {
-    const resolved = await ensureWritableCookiesFile(cookiesFilePathFromEnv);
+    const resolved = await copyCookiesFile(cookiesFilePathFromEnv);
     cookiesPathToUse = resolved.path;
     cookiesCleanup = resolved.cleanup;
   }
@@ -506,115 +496,19 @@ export async function downloadSubtitles(
       lang,
       logger
     );
-    recordSubtitleRequest(platform, 'yt_dlp', 'ok');
+    recordSubtitleRequest(platform, 'ok');
     // Only a track proves the caption endpoint answered: a run that found nothing may
     // never have asked it, and clearing on that would walk the server back into the limit.
     if (content) clearSubtitlesRateLimit(url);
     return content;
   } catch (error) {
     const limited = noteIfRateLimited(url, error);
-    recordSubtitleRequest(platform, 'yt_dlp', limited ? 'rate_limited' : 'error');
+    recordSubtitleRequest(platform, limited ? 'rate_limited' : 'error');
     rethrowInfra(error);
     logger?.error({ error }, 'Error downloading subtitles');
     return null;
   } finally {
     await cookiesCleanup?.();
-  }
-}
-
-/** A listed track we can fetch ourselves: not an HLS manifest, and an absolute https URL. */
-function directTrackUrl(
-  track: { ext?: string; url?: string },
-  format: SubtitleFormat
-): string | null {
-  if (track.ext !== format || !track.url?.startsWith('https://')) return null;
-  try {
-    const { hostname, pathname } = new URL(track.url);
-    // YouTube lists the auto track as an HLS manifest too; ffmpeg-free code cannot read it.
-    if (hostname.startsWith('manifest.') || pathname.endsWith('.m3u8')) return null;
-  } catch {
-    return null;
-  }
-  return track.url;
-}
-
-/**
- * Downloads one listed track by its own URL: ~0.2 s against the 4–7 s a second yt-dlp
- * run costs. Returns null whenever anything is off, and the yt-dlp path takes over.
- */
-export async function downloadSubtitleTrackDirect(
-  data: YtDlpVideoInfo | null | undefined,
-  type: 'official' | 'auto',
-  lang: string,
-  format: SubtitleFormat,
-  logger?: FastifyBaseLogger,
-  /** Counted against this platform's caption budget; omit only where nothing is counted. */
-  platform = 'unknown'
-): Promise<string | null> {
-  const container = type === 'official' ? data?.subtitles : data?.automatic_captions;
-  // `lang` is the caller's: `toString` must not read Object.prototype.
-  const tracks = container && Object.hasOwn(container, lang) ? container[lang] : undefined;
-  const trackUrl = tracks
-    ?.map((t) => directTrackUrl(t, format))
-    .find((u): u is string => u != null);
-  if (!trackUrl) return null;
-  if (getYtDlpEnv().proxyFromEnv) {
-    // The operator routes the platform through a proxy; fetch would go around it.
-    logger?.debug({ type, lang }, 'YT_DLP_PROXY is set: leaving the track to yt-dlp');
-    return null;
-  }
-
-  const started = Date.now();
-  try {
-    const response = await fetch(trackUrl, {
-      // What yt-dlp sends (`std_headers`, with a fixed Chrome version from the range it
-      // picks from), so this stops looking like a bare Node runtime asking the endpoint a
-      // browser asked a second ago. Not a disguise: undici adds a `Sec-Fetch-Mode` of its
-      // own that yt-dlp never sends, and the TLS fingerprint stays Node's.
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-us,en;q=0.5',
-      },
-      signal: AbortSignal.timeout(parseIntEnv('SUBTITLE_FETCH_TIMEOUT_MS', 15000)),
-    });
-    recordSubtitleRequest(platform, 'direct', response.status === 429 ? 'rate_limited' : 'ok');
-    if (response.status === 429) {
-      // Measured on both limit days: the yt-dlp run that would follow asks the same
-      // endpoint and gets the same answer (82 refusals here, 198 there), so it is not
-      // worth the request. Its cookies do not exempt it — the canary carries them too.
-      logger?.warn({ type, lang }, 'Direct subtitle track fetch rate-limited');
-      throw new YtDlpError('rate_limited');
-    }
-    if (!response.ok) {
-      logger?.warn({ type, lang, status: response.status }, 'Direct subtitle track fetch failed');
-      return null;
-    }
-    const content = await response.text();
-    // The URL is signed and can answer with an HTML error page or an empty body. `srt` is
-    // what detectSubtitleFormat calls anything it does not recognise, so it needs a real cue.
-    if (
-      detectSubtitleFormat(content) !== format ||
-      (format === 'srt' && !CUE_TIMESTAMP_RE.test(content))
-    ) {
-      logger?.warn(
-        { type, lang, length: content.length },
-        'Direct subtitle track is not subtitles'
-      );
-      return null;
-    }
-    logger?.info({ type, lang, format, ms: Date.now() - started }, 'Downloaded subtitles directly');
-    return content;
-  } catch (error) {
-    if (error instanceof HttpError) throw error;
-    // The request left the server even though the answer never arrived: it counts.
-    recordSubtitleRequest(platform, 'direct', 'error');
-    logger?.warn(
-      { type, lang, error: error instanceof Error ? error.message : String(error) },
-      'Direct subtitle track fetch failed'
-    );
-    return null;
   }
 }
 
@@ -626,7 +520,8 @@ export type PlaylistSubtitlesResult = {
 /** Options for downloadPlaylistSubtitles */
 export type DownloadPlaylistSubtitlesOptions = {
   type?: 'official' | 'auto';
-  lang?: string;
+  /** Required: one run cannot pick each video's original language (ADR 006). */
+  lang: string;
   /** Subtitle format: srt, vtt, ass, lrc (default from YT_DLP_SUB_FORMAT or srt) */
   format?: SubtitleFormat | null;
   /** yt-dlp -I/--playlist-items, e.g. "1:5", "1,3,7", "-1" */
@@ -787,10 +682,10 @@ async function handlePlaylistDownloadError(
  */
 export async function downloadPlaylistSubtitles(
   url: string,
-  options: DownloadPlaylistSubtitlesOptions = {},
+  options: DownloadPlaylistSubtitlesOptions,
   logger?: FastifyBaseLogger
 ): Promise<PlaylistSubtitlesResult[]> {
-  const { type = 'auto', lang = 'en', format, playlistItems, maxItems } = options;
+  const { type = 'auto', lang, format, playlistItems, maxItems } = options;
   const subFormat = resolveSubtitleFormat(format);
   // One playlist run asks for as many tracks as it has items: the heaviest caller of the
   // caption endpoint must be the first to stop while the platform is refusing.
@@ -805,7 +700,7 @@ export async function downloadPlaylistSubtitles(
   let cookiesPathToUse = cookiesFilePathFromEnv;
   let cookiesCleanup: (() => Promise<void>) | undefined;
   if (cookiesFilePathFromEnv) {
-    const resolved = await ensureWritableCookiesFile(cookiesFilePathFromEnv);
+    const resolved = await copyCookiesFile(cookiesFilePathFromEnv);
     cookiesPathToUse = resolved.path;
     cookiesCleanup = resolved.cleanup;
   }
@@ -878,7 +773,7 @@ export async function downloadPlaylistSubtitles(
     } catch (error: unknown) {
       if (error instanceof HttpError) throw error;
       noteIfRateLimited(url, error);
-      return handlePlaylistDownloadError(
+      return await handlePlaylistDownloadError(
         error,
         readPlaylistSubtitleResults,
         buildFullArgs,
@@ -966,27 +861,6 @@ export async function fetchVideoChapters(
     );
 }
 
-export async function fetchAvailableSubtitles(
-  url: string,
-  logger?: FastifyBaseLogger
-): Promise<AvailableSubtitles | null> {
-  const data = await fetchYtDlpJson(url, logger);
-  if (!data) {
-    return null;
-  }
-
-  const official = data.subtitles ? Object.keys(data.subtitles) : [];
-  const auto = data.automatic_captions ? Object.keys(data.automatic_captions) : [];
-
-  const sortedOfficial = [...official].sort((a, b) => a.localeCompare(b));
-  const sortedAuto = [...auto].sort((a, b) => a.localeCompare(b));
-
-  return {
-    official: sortedOfficial,
-    auto: sortedAuto,
-  };
-}
-
 /**
  * Length of a media file in seconds by ffprobe; NaN when it cannot be read.
  *
@@ -1029,7 +903,7 @@ export async function downloadAudio(
   let cookiesPathToUse = cookiesFilePathFromEnv;
   let cookiesCleanup: (() => Promise<void>) | undefined;
   if (cookiesFilePathFromEnv) {
-    const resolved = await ensureWritableCookiesFile(cookiesFilePathFromEnv);
+    const resolved = await copyCookiesFile(cookiesFilePathFromEnv);
     cookiesPathToUse = resolved.path;
     cookiesCleanup = resolved.cleanup;
   }
@@ -1177,6 +1051,7 @@ async function fetchVideoStreamInfo(
   url: string,
   formatSelector: string,
   envArgs: string[],
+  deadline: number | undefined,
   logger?: FastifyBaseLogger
 ): Promise<VideoStreamInfo | null> {
   const args = [
@@ -1196,7 +1071,7 @@ async function fetchVideoStreamInfo(
   try {
     const { stdout, stderr } = await execFileAsync('yt-dlp', args, {
       maxBuffer: 10 * 1024 * 1024,
-      timeout: getFrameCaptureTimeout(),
+      deadline,
     });
     if (stderr) logger?.debug({ stderr }, 'yt-dlp stderr');
 
@@ -1231,8 +1106,10 @@ async function runFfmpegFrameCapture(opts: {
   quality: number;
   outputPath: string;
   proxy?: string;
+  deadline: number | undefined;
 }): Promise<void> {
-  const args: string[] = ['-hide_banner', '-loglevel', 'error'];
+  // A stalled read of the stream gives up after 15 s instead of holding the process.
+  const args: string[] = ['-hide_banner', '-loglevel', 'error', '-rw_timeout', '15000000'];
   if (opts.proxy) {
     args.push('-http_proxy', opts.proxy);
   }
@@ -1246,7 +1123,10 @@ async function runFfmpegFrameCapture(opts: {
   args.push('-y', opts.outputPath);
   await execFileAsync('ffmpeg', args, {
     maxBuffer: 10 * 1024 * 1024,
-    timeout: getFrameCaptureTimeout(),
+    deadline: opts.deadline,
+    // ffmpeg acts on SIGTERM between packets, so one blocked in a network read ignored
+    // the timeout for 4–20 minutes (prod, 2026-09-24).
+    killSignal: 'SIGKILL',
   });
 }
 
@@ -1271,6 +1151,7 @@ async function downloadVideoSection(
   timestampSeconds: number,
   formatSelector: string,
   envArgs: string[],
+  deadline: number | undefined,
   logger?: FastifyBaseLogger
 ): Promise<string | null> {
   const tempDir = tmpdir();
@@ -1281,6 +1162,10 @@ async function downloadVideoSection(
     '--download-sections',
     `*${timestampSeconds}-${timestampSeconds + 2}`,
     '--force-keyframes-at-cuts',
+    // yt-dlp cuts the section with its own ffmpeg, which outlives a yt-dlp killed by the
+    // timeout; this ends that ffmpeg's stalled read too.
+    '--downloader-args',
+    'ffmpeg_i:-rw_timeout 15000000',
     '--output',
     `${outputBase}.%(ext)s`,
     '--no-playlist',
@@ -1290,7 +1175,7 @@ async function downloadVideoSection(
   try {
     await execFileAsync('yt-dlp', args, {
       maxBuffer: 10 * 1024 * 1024,
-      timeout: getFrameCaptureTimeout(),
+      deadline,
     });
   } catch (error: unknown) {
     const details = collectExecFileErrorDetails(error);
@@ -1332,12 +1217,16 @@ export async function captureVideoFrame(
     `${urlToSafeBase(url, 'frame')}.${format === 'png' ? 'png' : 'jpg'}`
   );
   const formatSelector = buildFrameFormatSelector(width);
+  // One budget for the whole call, not one per process: the lookup, the direct reads, the
+  // section download and the clip read each used to get all of it. 0 means no limit.
+  const budget = getFrameCaptureTimeout();
+  const deadline = budget > 0 ? Date.now() + budget : undefined;
 
   const { jsRuntimes, remoteComponents, cookiesFilePathFromEnv, proxyFromEnv } = getYtDlpEnv();
   let cookiesPathToUse = cookiesFilePathFromEnv;
   let cookiesCleanup: (() => Promise<void>) | undefined;
   if (cookiesFilePathFromEnv) {
-    const resolved = await ensureWritableCookiesFile(cookiesFilePathFromEnv);
+    const resolved = await copyCookiesFile(cookiesFilePathFromEnv);
     cookiesPathToUse = resolved.path;
     cookiesCleanup = resolved.cleanup;
   }
@@ -1354,7 +1243,7 @@ export async function captureVideoFrame(
     await logCookiesFileStatus(logger, cookiesFilePathFromEnv);
     logger?.info({ timestampSeconds, format, width }, 'Capturing video frame');
 
-    const streamInfo = await fetchVideoStreamInfo(url, formatSelector, envArgs, logger);
+    const streamInfo = await fetchVideoStreamInfo(url, formatSelector, envArgs, deadline, logger);
     const videoId = streamInfo?.videoId ?? extractYouTubeVideoId(url) ?? 'unknown';
 
     if (
@@ -1382,6 +1271,7 @@ export async function captureVideoFrame(
           quality,
           outputPath,
           proxy: proxyFromEnv,
+          deadline,
         });
         const data = await readFrameFile(outputPath);
         if (data) {
@@ -1397,7 +1287,14 @@ export async function captureVideoFrame(
       }
     }
 
-    clipPath = await downloadVideoSection(url, timestampSeconds, formatSelector, envArgs, logger);
+    clipPath = await downloadVideoSection(
+      url,
+      timestampSeconds,
+      formatSelector,
+      envArgs,
+      deadline,
+      logger
+    );
     if (clipPath) {
       try {
         await runFfmpegFrameCapture({
@@ -1406,6 +1303,7 @@ export async function captureVideoFrame(
           format,
           quality,
           outputPath,
+          deadline,
         });
         const data = await readFrameFile(outputPath);
         if (data) {
@@ -1417,6 +1315,8 @@ export async function captureVideoFrame(
       }
     }
 
+    // The clip read has no next stage to notice that the budget ran out while it ran.
+    if (deadline !== undefined && Date.now() >= deadline) throw new YtDlpError('timeout');
     const details = collectExecFileErrorDetails(
       lastError ??
         new Error(
@@ -1576,31 +1476,26 @@ async function logCookiesFileStatus(
 }
 
 /**
- * Returns a writable path for the cookies file. yt-dlp reads and writes cookies;
- * if the original file is read-only (e.g. Docker volume), it fails on save.
- * Copies to a temp writable location when the original is not writable.
- * Exported for testing.
+ * Gives one yt-dlp run its own copy of the cookies file. yt-dlp rewrites the file it is
+ * given when it exits, truncating it first, so a run killed during that write left the
+ * shared file empty and every later run refused it (prod, 2026-09-24). A copy also works
+ * when the original is mounted read-only. Exported for testing.
  */
-export async function ensureWritableCookiesFile(
+export async function copyCookiesFile(
   originalPath: string
 ): Promise<{ path: string; cleanup: () => Promise<void> }> {
-  const { access } = await import('node:fs/promises');
-  try {
-    await access(originalPath, constants.R_OK | constants.W_OK);
-    return { path: originalPath, cleanup: async () => {} };
-  } catch {
-    const tempPath = join(
-      tmpdir(),
-      `cookies_${Date.now()}_${Math.random().toString(36).slice(2)}.txt`
-    );
-    await copyFile(originalPath, tempPath);
-    return {
-      path: tempPath,
-      cleanup: async () => {
-        await unlink(tempPath).catch(() => {});
-      },
-    };
-  }
+  const tempPath = join(
+    tmpdir(),
+    `cookies_${Date.now()}_${Math.random().toString(36).slice(2)}.txt`
+  );
+  // 0600: a cookies file is a signed-in session, and tmpdir may be shared.
+  await writeFile(tempPath, await readFile(originalPath), { mode: 0o600 });
+  return {
+    path: tempPath,
+    cleanup: async () => {
+      await unlink(tempPath).catch(() => {});
+    },
+  };
 }
 
 /**
@@ -1612,6 +1507,8 @@ export async function ensureWritableCookiesFile(
 export type AppendYtDlpEnvArgsOptions = {
   /** When false, omit --no-progress and --quiet (e.g. verbose diagnostic replay). Default true. */
   quiet?: boolean;
+  /** When true, ignore YT_DLP_NO_WARNINGS: the metadata run reads the warnings (rethrowRefusalWarning). */
+  keepWarnings?: boolean;
 };
 
 // Exported for testing.
@@ -1629,7 +1526,7 @@ export function appendYtDlpEnvArgs(
     out.push('--no-progress', '--quiet');
   }
 
-  if (process.env.YT_DLP_NO_WARNINGS === '1') {
+  if (process.env.YT_DLP_NO_WARNINGS === '1' && !opts?.keepWarnings) {
     out.push('--no-warnings');
   }
 
@@ -1845,7 +1742,7 @@ export async function searchVideos(
   let cookiesPathToUse = cookiesFilePathFromEnv;
   let cookiesCleanup: (() => Promise<void>) | undefined;
   if (cookiesFilePathFromEnv) {
-    const resolved = await ensureWritableCookiesFile(cookiesFilePathFromEnv);
+    const resolved = await copyCookiesFile(cookiesFilePathFromEnv);
     cookiesPathToUse = resolved.path;
     cookiesCleanup = resolved.cleanup;
   }
@@ -1915,7 +1812,7 @@ export async function fetchYtDlpJson(
   let cookiesPathToUse = cookiesFilePathFromEnv;
   let cookiesCleanup: (() => Promise<void>) | undefined;
   if (cookiesFilePathFromEnv) {
-    const resolved = await ensureWritableCookiesFile(cookiesFilePathFromEnv);
+    const resolved = await copyCookiesFile(cookiesFilePathFromEnv);
     cookiesPathToUse = resolved.path;
     cookiesCleanup = resolved.cleanup;
   }
@@ -1925,22 +1822,28 @@ export async function fetchYtDlpJson(
   if (process.env.YT_DLP_IGNORE_NO_FORMATS !== '0') {
     optionalArgs.push('--ignore-no-formats-error');
   }
-  appendYtDlpEnvArgs(optionalArgs, {
-    jsRuntimes,
-    remoteComponents,
-    cookiesFilePathFromEnv: cookiesPathToUse,
-  });
+  // With --ignore-no-formats-error a refusal is only a warning, so --no-warnings would hide it.
+  appendYtDlpEnvArgs(
+    optionalArgs,
+    { jsRuntimes, remoteComponents, cookiesFilePathFromEnv: cookiesPathToUse },
+    { keepWarnings: true }
+  );
   const args = [...baseArgs, ...optionalArgs, url];
 
   try {
     await logCookiesFileStatus(logger, cookiesFilePathFromEnv);
     const timeout = parseIntEnv('YT_DLP_TIMEOUT', 60000);
     const { stdout, stderr } = await execFileAsync('yt-dlp', args, {
-      maxBuffer: 10 * 1024 * 1024,
+      // A dubbed video lists every auto-caption language once per audio track: 21 tracks
+      // made 11.7 MB of JSON for one 17-minute video, past the 10 MB this used to allow.
+      maxBuffer: 50 * 1024 * 1024,
       timeout,
     });
     if (stderr) {
       logger?.debug({ stderr }, 'yt-dlp stderr');
+    }
+    if (stdout.length > 10 * 1024 * 1024) {
+      logger?.info({ length: stdout.length }, 'Large yt-dlp JSON');
     }
 
     const trimmed = stdout.trim();

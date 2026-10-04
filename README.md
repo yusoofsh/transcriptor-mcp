@@ -79,7 +79,7 @@ If you want to run the server yourself, read [Self-host](#-self-host). The tools
 | *"Who published this and how many views?"* | `get_video_info` |
 | *"Go to the part about pricing"* | `get_video_chapters` |
 | *"Show me the screen at 4:12"* | `get_video_frame` |
-| *"Get transcripts for the first 5 videos in this playlist"* | `get_playlist_transcripts` |
+| *"Get English transcripts for the first 5 videos in this playlist"* | `get_playlist_transcripts` |
 | *"Find recent videos about X"* | `search_videos` (YouTube) |
 
 Long transcripts come in parts. Each response gives a cursor for the next part, so no text is lost.
@@ -91,7 +91,7 @@ Each tool that takes a video accepts `url`. This is a link from a [supported pla
 
 #### `get_transcript`
 
-Clean plain text, without timestamps, HTML, or speaker names. The tool finds the type and the language for you.
+Clean plain text, without timestamps, HTML, or speaker names. Without `lang`, the tool returns the track in the video's original language. Most platforms other than YouTube do not say which language a video is in; when the tool cannot tell which track that is, it answers with the list of tracks, and you call it again with `type` and `lang`. The inputs are the same as for `get_raw_subtitles`.
 
 Response: `videoId`, `url` (the video page, as the server resolved it), `type`, `lang`, `text`, `is_truncated`, `total_length`, `start_offset`, `end_offset`. When more text is available, the response also has `next_cursor`.
 
@@ -101,8 +101,8 @@ Raw SRT or VTT content, in parts.
 
 Input:
 
-- `type` — `official` or `auto`
-- `lang` — a language code
+- `type` — `official` or `auto`. Without `lang`, the tool picks a track of this type
+- `lang` — a language code or track name, as `get_available_subtitles` lists it. Without it, the video's original language, as for `get_transcript`
 - `response_limit` — default `50000`, minimum `1000`, maximum `200000`
 - `next_cursor` — the cursor of the previous response
 
@@ -143,7 +143,7 @@ Response: an image block, plus `url`, `timestampSeconds`, `timestamp`, `mimeType
 Input:
 
 - `url` — a playlist URL, or a watch URL with `list=`
-- `type`, `lang`, `format` — the same as `get_raw_subtitles`
+- `type`, `lang`, `format` — the same as `get_raw_subtitles`, except that `lang` is required: the original language is picked only for one video at a time
 - `playlistItems` — a yt-dlp `-I` value such as `1:5`, `1,3,7`, or `-1`
 - `maxItems` — the maximum number of videos
 
@@ -268,14 +268,14 @@ The Swagger interface is at `http://localhost:3000/docs`. For a full stack with 
 ```bash
 npm ci
 npm run build
-npm run dev:mcp        # stdio, hot reload
-npm run dev:mcp:http   # Streamable HTTP, hot reload
+npm run start:mcp        # stdio
+npm run start:mcp:http   # Streamable HTTP on port 4200
 npm test
 ```
 
 You need Node.js 22 or later (20 still works, but it reached end of life in April 2026), and `yt-dlp` in your PATH. Frame capture needs `ffmpeg`, and `WHISPER_MAX_DURATION_SECONDS` needs `ffprobe` (both ship in the same package, and in the Docker image). Other scripts: `lint`, `type-check`, `format`, `test:coverage`, `test:e2e:api`, and `test:e2e:mcp`.
 
-**Releases.** The version comes from `package.json` at runtime, through [src/version.ts](src/version.ts). Change this version, move the `[Unreleased]` entries of the changelog into the new version, then push a `v*` tag. CI builds both images and publishes the [MCP Registry](https://registry.modelcontextprotocol.io) entry from [server.json](server.json).
+**Releases.** The maintainer cuts them. The steps are in [.claude/skills/release/SKILL.md](.claude/skills/release/SKILL.md). The version comes from `package.json` at runtime, through [src/version.ts](src/version.ts). Pushing a `v*` tag makes CI build both images and publish the [MCP Registry](https://registry.modelcontextprotocol.io) entry from [server.json](server.json).
 
 **Layout.** `src/mcp.ts` (stdio entry), `src/mcp-http.ts` (Streamable HTTP), `src/mcp-core.ts` (tools, prompts, widgets), `src/youtube.ts` (yt-dlp), `src/whisper.ts`, `src/cache.ts`, `src/index.ts` (REST API), `load/` (k6), and `src/e2e/` (Docker smoke tests).
 
@@ -285,7 +285,7 @@ You need Node.js 22 or later (20 still works, but it reached end of life in Apri
 
 ## 🤝 Contributing
 
-Pull requests are welcome. Fork the repository, make a branch, and make sure that `npm test` and `npm run lint` pass. Then open a pull request.
+Pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) first: it describes the cycle from issue to review, for people and for coding agents.
 
 ## ⚖️ Legal
 

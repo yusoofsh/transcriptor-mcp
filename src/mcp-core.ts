@@ -28,9 +28,11 @@ import {
   HttpError,
   INVALID_LANGUAGE_MESSAGE,
   INVALID_VIDEO_URL_MESSAGE,
+  LIST_ANSWER_STEP,
   NotFoundError,
   type NotFoundDetails,
   ServerBusyError,
+  UNEXPECTED_ERROR_MESSAGE,
   ValidationError,
   YtDlpError,
 } from './errors.js';
@@ -38,6 +40,7 @@ import { extractPlatformFromUrl } from './platform.js';
 import {
   normalizeVideoInput,
   preferredTrackOrder,
+  sameTrack,
   sanitizeLang,
   validateAndDownloadSubtitles,
   validateAndFetchAvailableSubtitles,
@@ -144,12 +147,14 @@ const subtitleInputSchema = baseInputSchema.extend({
   type: z
     .enum(['official', 'auto'])
     .optional()
-    .describe('Subtitle track type: official or auto-generated'),
+    .describe(
+      'Subtitle track type: official or auto-generated. Without lang, the server picks a track of this type'
+    ),
   lang: z
     .string()
     .optional()
     .describe(
-      'Language code (e.g. en, es). When omitted with Whisper fallback, language is auto-detected'
+      "Language code or track name as get_available_subtitles lists it (e.g. en, es, en_US). Omit to get the video's original language; when the server cannot tell which track that is, it answers with the list of tracks"
     ),
   response_limit: z
     .number()
@@ -306,7 +311,12 @@ const playlistTranscriptsInputSchema = z.object({
     .enum(['official', 'auto'])
     .optional()
     .describe('Subtitle track type: official or auto-generated (default: auto)'),
-  lang: z.string().optional().describe('Language code (e.g. en, ru). Default: en'),
+  lang: z
+    .string()
+    .optional()
+    .describe(
+      'Language code (e.g. en, ru). Required: the original language is picked only for one video at a time (get_transcript)'
+    ),
   format: z
     .enum(['srt', 'vtt', 'ass', 'lrc'])
     .optional()
@@ -394,21 +404,26 @@ function toolError(message: string): ToolErrorResult {
 const TRACK_HINT_LIMIT = 15;
 
 /**
- * The codes the caller can actually ask for, appended to a "no subtitles" answer. Ranked
- * by the same rule auto-discovery uses, with the language the caller just asked for in the
- * place the spoken language takes there.
+ * The codes the caller can actually ask for, appended to a "no subtitles" answer: `-orig`
+ * first, then the language of the track that just came back without text, then English.
+ * That track itself goes last, under both of its names (`en` and `en-orig`): asking for it
+ * again gets the same nothing. The transcript widget reads this sentence back
+ * (parseToolError in ui/shared/subtitleTracks.ts): if you change one, change the other.
  */
 function trackHint(details?: NotFoundDetails): string {
   const official = details?.official ?? [];
   const auto = details?.auto ?? [];
   if (official.length === 0 && auto.length === 0) return '';
-  const show = (codes: string[]): string => {
+  const tried = details?.tried;
+  const show = (codes: string[], type: 'official' | 'auto'): string => {
     if (codes.length === 0) return 'none';
-    const ranked = preferredTrackOrder(codes, details?.tried);
+    const dead = (code: string): number =>
+      tried?.type === type && sameTrack(code, tried.lang) ? 1 : 0;
+    const ranked = preferredTrackOrder(codes, tried?.lang).sort((a, b) => dead(a) - dead(b));
     const rest = ranked.length - TRACK_HINT_LIMIT;
     return `${ranked.slice(0, TRACK_HINT_LIMIT).join(', ')}${rest > 0 ? ` (+${rest} more, full list: get_available_subtitles)` : ''}`;
   };
-  return ` Available tracks — official: ${show(official)}; auto: ${show(auto)}.`;
+  return ` Available tracks — official: ${show(official, 'official')}; auto: ${show(auto, 'auto')}.`;
 }
 
 /** What a tool was called with, as far as the per-call log line needs it. */
@@ -460,8 +475,39 @@ function toolCallLogFields({ args, extra }: ToolCall) {
   };
 }
 
-export const UNEXPECTED_TOOL_ERROR_MESSAGE =
-  'Internal server error (a fault in this server, not in your request). Retry once; if it fails again, do not retry — tell the user this cannot be completed right now.';
+/**
+ * What the caller reads of a failed tool call or resource read. `where` names the tool or
+ * the resource in the log line.
+ */
+function errorText(err: unknown, log: FastifyBaseLogger, where: Record<string, string>): string {
+  // Load shedding is a state of this server, not a fault: say so and move on.
+  if (err instanceof ServerBusyError) {
+    log.warn(where, 'MCP tool rejected: server busy');
+    return err.message;
+  }
+  // Every error class we raise on purpose carries a message meant for the caller.
+  if (err instanceof HttpError && err.statusCode < 500) return err.message;
+  log.error({ err, ...where }, 'MCP tool unexpected error');
+  Sentry.captureException(err);
+  // An unplanned error's message can hold the yt-dlp command line, a cookies
+  // path or a proxy URL, so it never goes to the caller.
+  return err instanceof YtDlpError ? err.message : UNEXPECTED_ERROR_MESSAGE;
+}
+
+/** The SDK answers a failed resource read with the thrown message, so it gets the tools' rule. */
+function withResourceErrorHandling<A extends unknown[], R>(
+  log: FastifyBaseLogger,
+  resource: string,
+  read: (...args: A) => Promise<R>
+): (...args: A) => Promise<R> {
+  return async (...args) => {
+    try {
+      return await read(...args);
+    } catch (err) {
+      throw new Error(errorText(err, log, { resource }));
+    }
+  };
+}
 
 async function withToolErrorHandling(
   toolName: string,
@@ -480,20 +526,7 @@ async function withToolErrorHandling(
     if (err instanceof NotFoundError) {
       return toolError(err.message + trackHint(err.details));
     }
-    // Load shedding is a state of this server, not a fault: say so and move on.
-    if (err instanceof ServerBusyError) {
-      log.warn({ tool: toolName }, 'MCP tool rejected: server busy');
-      return toolError(err.message);
-    }
-    // Every error class we raise on purpose carries a message meant for the caller.
-    if (err instanceof HttpError && err.statusCode < 500) {
-      return toolError(err.message);
-    }
-    log.error({ err, tool: toolName }, 'MCP tool unexpected error');
-    Sentry.captureException(err);
-    // An unplanned error's message can hold the yt-dlp command line, a cookies
-    // path or a proxy URL, so it never goes to the caller.
-    return toolError(err instanceof YtDlpError ? err.message : UNEXPECTED_TOOL_ERROR_MESSAGE);
+    return toolError(errorText(err, log, { tool: toolName }));
   } finally {
     const seconds = (performance.now() - start) / 1000;
     const outcome = reason === undefined ? 'ok' : 'error';
@@ -532,7 +565,7 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
     {
       title: 'Get video transcript',
       description:
-        'Fetch cleaned subtitles as plain text for a video (YouTube, Twitter/X, Instagram, TikTok, Twitch, Vimeo, Facebook, Bilibili, VK, Dailymotion, Reddit). Uses auto-discovery for type/language when omitted. Optional: type, lang, response_limit (when omitted returns full transcript), next_cursor for pagination.',
+        "Fetch cleaned subtitles as plain text for a video (YouTube, Twitter/X, Instagram, TikTok, Twitch, Vimeo, Facebook, Bilibili, VK, Dailymotion, Reddit). Without lang, returns the video's original language, or the list of tracks when the server cannot tell which one that is. Optional: type, lang, response_limit (when omitted returns full transcript), next_cursor for pagination.",
       inputSchema: subtitleInputSchema.shape,
       outputSchema: transcriptOutputSchema.shape,
       annotations: {
@@ -595,7 +628,7 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
     {
       title: 'Get raw video subtitles',
       description:
-        'Fetch raw SRT/VTT subtitles for a video (supported platforms). Optional: type, lang, response_limit (when omitted returns full content), next_cursor for pagination.',
+        "Fetch raw SRT/VTT subtitles for a video (supported platforms). Without lang, the video's original language, as in get_transcript. Optional: type, lang, response_limit (when omitted returns full content), next_cursor for pagination.",
       inputSchema: subtitleInputSchema,
       outputSchema: rawSubtitlesOutputSchema,
       annotations: {
@@ -879,10 +912,20 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
           );
         }
 
-        // Kept as the values actually used, not as the arguments: the empty answer below
-        // reports what the server asked for, and a silent fallback is what it asked for.
+        // Kept as the value actually used, not as the argument: the empty answer below
+        // reports what the server asked for, and that includes the default type.
         const type = args.type ?? 'auto';
-        const lang = args.lang ? (sanitizeLang(args.lang) ?? 'en') : 'en';
+        // One run cannot pick each video's original language: a pattern such as `.*-orig`
+        // matches every audio track of a dubbed video, one caption request each (ADR 006).
+        if (!args.lang) {
+          throw new ValidationError(
+            'Pass lang for this playlist (for example "en"): the server picks the original language only for one video at a time.',
+            'Language required'
+          );
+        }
+        // Refused, not replaced: a lang nobody asked for costs a caption request per video.
+        const lang = sanitizeLang(args.lang);
+        if (!lang) throw new ValidationError(INVALID_LANGUAGE_MESSAGE, 'Invalid language code');
 
         const format =
           args.format && ['srt', 'vtt', 'ass', 'lrc'].includes(args.format)
@@ -908,7 +951,7 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
 
         const text =
           results.length === 0
-            ? `No transcripts could be downloaded for this selection with type "${type}" and lang "${lang}" (defaults: auto, en). Do not repeat the same call; ask the user for one video URL from this playlist and call get_available_subtitles on it, or retry with a different type and lang.`
+            ? `No transcripts could be downloaded for this selection with type "${type}" and lang "${lang}". Do not repeat the same call; ask the user for one video URL from this playlist and call get_available_subtitles on it, or retry with a different type and lang.`
             : results.map((r) => `[${r.videoId}]\n${r.text}`).join('\n\n---\n\n');
 
         return {
@@ -1083,7 +1126,7 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
         'Interactive carousel for YouTube search results with video details and subtitle search',
       mimeType: RESOURCE_MIME_TYPE,
     },
-    async () => {
+    withResourceErrorHandling(log, SEARCH_UI_URI, async () => {
       const html = await readCachedUiHtml('search.html');
       return {
         contents: [
@@ -1099,7 +1142,7 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
           },
         ],
       };
-    }
+    })
   );
 
   registerAppResource(
@@ -1111,7 +1154,7 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
       description: 'Video card with metadata and description',
       mimeType: RESOURCE_MIME_TYPE,
     },
-    async () => {
+    withResourceErrorHandling(log, VIDEO_INFO_UI_URI, async () => {
       const html = await readCachedUiHtml('video-info.html');
       return {
         contents: [
@@ -1126,7 +1169,7 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
           },
         ],
       };
-    }
+    })
   );
 
   registerAppResource(
@@ -1138,7 +1181,7 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
       description: 'Video card with searchable timed subtitles',
       mimeType: RESOURCE_MIME_TYPE,
     },
-    async () => {
+    withResourceErrorHandling(log, TRANSCRIPT_UI_URI, async () => {
       const html = await readCachedUiHtml('transcript.html');
       return {
         contents: [
@@ -1153,7 +1196,7 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
           },
         ],
       };
-    }
+    })
   );
 
   registerAppResource(
@@ -1165,7 +1208,7 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
       description: 'Captured video frame with timestamp controls',
       mimeType: RESOURCE_MIME_TYPE,
     },
-    async () => {
+    withResourceErrorHandling(log, VIDEO_FRAME_UI_URI, async () => {
       const html = await readCachedUiHtml('video-frame.html');
       return {
         contents: [
@@ -1180,7 +1223,7 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
           },
         ],
       };
-    }
+    })
   );
 
   const INFO_URI = 'transcriptor://info';
@@ -1306,13 +1349,20 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
         'Get the transcript for a video by YouTube video ID. Use URI format: transcriptor://transcript/{videoId}',
       mimeType: 'application/json',
     },
-    async (uri, variables) => {
+    withResourceErrorHandling(log, 'transcriptor://transcript', async (uri, variables) => {
       const { videoId } = variables as { videoId: string };
       const url = `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`;
       const result = await validateAndDownloadSubtitles(
         { url, type: undefined, lang: undefined },
         log
-      );
+      ).catch((err: unknown) => {
+        // This URI cannot carry type or lang: where the answer asks for them, name the tracks
+        // and the tool that takes them. Next to any other step it would be a second one.
+        if (err instanceof NotFoundError && err.message.endsWith(LIST_ANSWER_STEP)) {
+          err.message += `${trackHint(err.details)} This resource takes no type or lang; get_transcript does.`;
+        }
+        throw err;
+      });
       const plainText = parseSubtitles(result.subtitlesContent);
       const payload = {
         videoId: result.videoId,
@@ -1330,37 +1380,21 @@ export function createMcpServer(opts?: CreateMcpServerOptions) {
           },
         ],
       };
-    }
+    })
   );
 
   return server;
 }
 
+/**
+ * Type and lang go to the service layer as given: it checks the lang, and it fills in the
+ * type for a lang without one, which its "no subtitles" answer then says (ADR 006).
+ */
 function resolveSubtitleArgs(args: z.infer<typeof subtitleInputSchema>) {
-  const url = requireVideoUrl(args.url);
-
-  // Both absent is the auto-discovery request, and both stay undefined so the flow below
-  // can tell it from a caller who named one of the two.
-  let type: 'official' | 'auto' | undefined;
-  let lang: string | undefined;
-
-  if (args.type !== undefined || args.lang !== undefined) {
-    type = args.type ?? 'auto';
-    if (args.lang === undefined || args.lang === null) {
-      lang = 'en';
-    } else {
-      const sanitized = sanitizeLang(args.lang);
-      if (!sanitized) {
-        throw new ValidationError(INVALID_LANGUAGE_MESSAGE, 'Invalid language code');
-      }
-      lang = sanitized;
-    }
-  }
-
   return {
-    url,
-    type,
-    lang,
+    url: requireVideoUrl(args.url),
+    type: args.type,
+    lang: args.lang,
     format: args.format,
     responseLimit: args.response_limit ?? Infinity,
     nextCursor: args.next_cursor,

@@ -7,7 +7,6 @@ import {
   formatTimestamp,
   sanitizeVideoId,
   sanitizeLang,
-  shouldAutoDiscoverSubtitles,
   validateAndDownloadSubtitles,
   validateAndFetchAvailableSubtitles,
   validateAndFetchVideoInfo,
@@ -18,7 +17,7 @@ import {
 import { extractPlatformFromUrl } from './platform.js';
 import * as youtube from './youtube.js';
 import { renderPrometheus } from './metrics.js';
-import { get as cacheGet, set as cacheSet } from './cache.js';
+import { buildCacheKey, get as cacheGet, getCacheConfig, set as cacheSet } from './cache.js';
 import * as whisper from './whisper.js';
 import * as whisperJobs from './whisper-jobs.js';
 import {
@@ -26,31 +25,31 @@ import {
   resetSubtitleRateLimitsForTests,
 } from './subtitle-rate-limit.js';
 
-jest.mock('./whisper.js', () => ({
-  getWhisperConfig: jest.fn(() => ({ mode: 'off', timeout: 600_000 })),
+jest.mock('./whisper.js', () => ({ getWhisperConfig: jest.fn() }));
+
+jest.mock('./whisper-jobs.js', () => ({ startOrReuseWhisperJob: jest.fn() }));
+
+jest.mock('./cache.js', () => ({
+  ...jest.requireActual<typeof import('./cache.js')>('./cache.js'),
+  getCacheConfig: jest.fn(),
+  get: jest.fn(),
+  set: jest.fn(),
 }));
 
-jest.mock('./whisper-jobs.js', () => ({
-  startOrReuseWhisperJob: jest.fn(),
-}));
-
-jest.mock('./cache.js', () => {
-  const actual = jest.requireActual<typeof import('./cache.js')>('./cache.js');
-  return {
-    ...actual,
-    getCacheConfig: jest.fn(() => ({
-      mode: 'off',
-      ttlSubtitlesSeconds: 604800,
-      ttlMetadataSeconds: 3600,
-    })),
-    get: jest.fn().mockResolvedValue(undefined),
-    set: jest.fn().mockResolvedValue(undefined),
-  };
-});
-
-// Every path that reads metadata now goes through fetchYtDlpJson: without a default spy a
-// test that does not mock it would run the real yt-dlp against YouTube.
 beforeEach(() => {
+  // restoreAllMocks in afterEach restores only spies. Without this reset, a mock that one test
+  // changes stays changed for the next test, and results depend on test order.
+  jest.resetAllMocks();
+  (whisper.getWhisperConfig as jest.Mock).mockReturnValue({ mode: 'off', timeout: 600_000 });
+  (getCacheConfig as jest.Mock).mockReturnValue({
+    mode: 'off',
+    ttlSubtitlesSeconds: 604800,
+    ttlMetadataSeconds: 3600,
+  });
+  (cacheGet as jest.Mock).mockResolvedValue(undefined);
+  (cacheSet as jest.Mock).mockResolvedValue(undefined);
+  // Every path that reads metadata now goes through fetchYtDlpJson: without a default spy a
+  // test that does not mock it would run the real yt-dlp against YouTube.
   jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue(null);
 });
 
@@ -308,6 +307,11 @@ describe('validation', () => {
       }
     });
 
+    it('refuses a chat replay, which is not a subtitle track', () => {
+      expect(sanitizeLang('live_chat')).toBe(null);
+      expect(sanitizeLang('rechat')).toBe(null);
+    });
+
     it('should return null for non-string inputs', () => {
       expect(sanitizeLang(null as any)).toBe(null);
       expect(sanitizeLang(undefined as any)).toBe(null);
@@ -320,55 +324,7 @@ describe('validation', () => {
     });
   });
 
-  describe('shouldAutoDiscoverSubtitles', () => {
-    it('should return true when both type and lang are undefined', () => {
-      expect(shouldAutoDiscoverSubtitles({ url: 'https://youtube.com/watch?v=x' })).toBe(true);
-    });
-
-    it('should return false when type is provided', () => {
-      expect(
-        shouldAutoDiscoverSubtitles({ url: 'https://youtube.com/watch?v=x', type: 'auto' })
-      ).toBe(false);
-    });
-
-    it('should return false when lang is provided', () => {
-      expect(
-        shouldAutoDiscoverSubtitles({ url: 'https://youtube.com/watch?v=x', lang: 'en' })
-      ).toBe(false);
-    });
-  });
-
   describe('validateAndDownloadSubtitles', () => {
-    async function untriedTracks(): Promise<number> {
-      const line = (await renderPrometheus())
-        .split('\n')
-        .find((l) => l.startsWith('subtitle_tracks_untried_total{platform="youtube"'));
-      return line ? Number(line.split(' ').pop()) : 0;
-    }
-
-    it('asks for the track anyone wanted, not the alphabetically first one', async () => {
-      jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue({
-        id: 'dQw4w9WgXcQ',
-        subtitles: { ar: [{ ext: 'vtt' }], de: [{ ext: 'vtt' }], en: [{ ext: 'vtt' }] },
-      } as never);
-      const download = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('WEBVTT\n\nhi');
-
-      const result = await validateAndDownloadSubtitles({
-        url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
-      });
-
-      expect(result.lang).toBe('en');
-      expect(download).toHaveBeenCalledTimes(1);
-      expect(download).toHaveBeenCalledWith(
-        expect.any(String),
-        'official',
-        'en',
-        undefined,
-        undefined,
-        expect.anything()
-      );
-    });
-
     it("prefers the video's own language over English", async () => {
       jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue({
         id: 'dQw4w9WgXcQ',
@@ -381,28 +337,13 @@ describe('validation', () => {
         url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
       });
 
-      expect(result.lang).toBe('de');
-    });
-
-    it('asks twice at most, and counts the tracks it left untried', async () => {
-      const many = (langs: string[]) => Object.fromEntries(langs.map((l) => [l, [{ ext: 'vtt' }]]));
-      jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue({
-        id: 'dQw4w9WgXcQ',
-        subtitles: many(['ar', 'de', 'es', 'fr', 'it']),
-        automatic_captions: many(['ar', 'de', 'es', 'fr', 'it']),
-      } as never);
-      // Every track listed, none of them downloadable: the ladder must stop, not walk.
-      const download = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue(null);
-      const before = await untriedTracks();
-
-      await expect(
-        validateAndDownloadSubtitles({ url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' })
-      ).rejects.toThrow(NotFoundError);
-
-      expect(download).toHaveBeenCalledTimes(2);
-      // Ten listed, two asked for: the other eight are what the cap cost, and they are
-      // the number to watch if callers start hearing "no subtitles" for videos that have some.
-      expect(await untriedTracks()).toBe(before + 8);
+      expect(result).toEqual({
+        videoId: 'dQw4w9WgXcQ',
+        type: 'official',
+        lang: 'de',
+        subtitlesContent: 'WEBVTT\n\nhi',
+        source: 'youtube',
+      });
     });
 
     it('should surface a classified yt-dlp failure instead of "no subtitles"', async () => {
@@ -444,6 +385,68 @@ describe('validation', () => {
 
       expect(jsonSpy).not.toHaveBeenCalled();
       expect(downloadSpy).not.toHaveBeenCalled();
+    });
+
+    it('answers from the cache during a hold, since nothing reaches the platform', async () => {
+      const url = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+      const track = {
+        videoId: 'dQw4w9WgXcQ',
+        type: 'auto',
+        lang: 'en-orig',
+        subtitlesContent: 'x',
+      };
+      (cacheGet as jest.Mock).mockImplementation((key: string) =>
+        Promise.resolve(
+          key === buildCacheKey('avail', url)
+            ? JSON.stringify({ videoId: 'dQw4w9WgXcQ', official: [], auto: ['en', 'en-orig'] })
+            : key === `sub:${url}:auto:en-orig:srt`
+              ? JSON.stringify(track)
+              : undefined
+        )
+      );
+      noteSubtitlesRateLimited(url);
+      const jsonSpy = jest.spyOn(youtube, 'fetchYtDlpJson');
+      const downloadSpy = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue(null);
+
+      expect(await validateAndDownloadSubtitles({ url, type: 'auto' })).toEqual(track);
+      expect(jsonSpy).not.toHaveBeenCalled();
+      expect(downloadSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not start speech-to-text during a hold when the cached list is empty', async () => {
+      const url = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+      (cacheGet as jest.Mock).mockImplementation((key: string) =>
+        Promise.resolve(
+          key === buildCacheKey('avail', url)
+            ? JSON.stringify({ videoId: 'dQw4w9WgXcQ', official: [], auto: [] })
+            : undefined
+        )
+      );
+      (whisper.getWhisperConfig as jest.Mock).mockReturnValue({ mode: 'local', timeout: 600_000 });
+      noteSubtitlesRateLimited(url);
+      const jsonSpy = jest.spyOn(youtube, 'fetchYtDlpJson');
+
+      await expect(validateAndDownloadSubtitles({ url })).rejects.toMatchObject({
+        name: 'YtDlpError',
+        reason: 'rate_limited',
+      });
+      expect(whisperJobs.startOrReuseWhisperJob).not.toHaveBeenCalled();
+      expect(jsonSpy).not.toHaveBeenCalled();
+    });
+
+    it('refuses a chat replay named as lang before any run', async () => {
+      const downloadSpy = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue(null);
+
+      for (const [url, lang] of [
+        ['https://www.youtube.com/watch?v=dQw4w9WgXcQ', 'live_chat'],
+        ['https://www.twitch.tv/videos/1', 'rechat'],
+      ]) {
+        await expect(
+          validateAndDownloadSubtitles({ url, type: 'official', lang })
+        ).rejects.toMatchObject({ name: 'ValidationError', errorLabel: 'Invalid language code' });
+      }
+      expect(downloadSpy).not.toHaveBeenCalled();
+      expect(youtube.fetchYtDlpJson).not.toHaveBeenCalled();
     });
 
     it('should throw ValidationError for invalid YouTube URL', async () => {
@@ -554,8 +557,6 @@ describe('validation', () => {
     });
 
     it('skips the cache when asked, so the canary always exercises yt-dlp', async () => {
-      (cacheGet as jest.Mock).mockClear();
-      (cacheSet as jest.Mock).mockClear();
       const downloadSpy = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('fresh');
       jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue({ id: 'dQw4w9WgXcQ' });
 
@@ -571,10 +572,24 @@ describe('validation', () => {
       expect(cacheSet).not.toHaveBeenCalled();
       // One probe, one yt-dlp run: the metadata JSON is for callers, not for the canary.
       expect(youtube.fetchYtDlpJson).not.toHaveBeenCalled();
-      expect(downloadSpy.mock.calls[0][5]).toBeUndefined();
+
+      // An empty probe neither reads nor writes the entry for a track with no text. Every probe
+      // must reach the platform.
+      downloadSpy.mockResolvedValue('');
+      await validateAndDownloadSubtitles(
+        { url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', type: 'auto', lang: 'en' } as any,
+        undefined,
+        { skipCache: true }
+      ).catch(() => null);
+      const noTextKeys = (mock: unknown): string[] =>
+        (mock as jest.Mock).mock.calls
+          .map((call: unknown[]) => String(call[0]))
+          .filter((key) => key.endsWith(':empty'));
+      expect(noTextKeys(cacheGet)).toEqual([]);
+      expect(noTextKeys(cacheSet)).toEqual([]);
     });
 
-    it('keys the cache by the format the content is in, not by whether one was named', async () => {
+    it('keys the cache by the format the content is in and by the type, not by whether a format was named', async () => {
       const url = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
       const keysFor = async (request: Record<string, unknown>) => {
         (cacheGet as jest.Mock).mockClear();
@@ -586,6 +601,10 @@ describe('validation', () => {
       const autoKey = `sub:${url}:auto-discovery:srt`;
       expect(await keysFor({})).toContain(autoKey);
       expect(await keysFor({ format: 'srt' })).toContain(autoKey);
+      // A type to keep to is its own entry: an answer without one may be of the other type.
+      const typedKey = `sub:${url}:auto-discovery:official:srt`;
+      expect(await keysFor({ type: 'official' })).toContain(typedKey);
+      expect(await keysFor({})).not.toContain(typedKey);
       const explicitKey = `sub:${url}:official:en:srt`;
       expect(await keysFor({ type: 'official', lang: 'en' })).toContain(explicitKey);
       expect(await keysFor({ type: 'official', lang: 'en', format: 'srt' })).toContain(explicitKey);
@@ -630,7 +649,6 @@ describe('validation', () => {
     });
 
     it('should call cache.set when Whisper finishes after WHISPER_TIMEOUT (explicit lang)', async () => {
-      (cacheSet as jest.Mock).mockClear();
       jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue(null);
       jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue({ id: 'dQw4w9WgXcQ' });
       (whisper.getWhisperConfig as jest.Mock).mockReturnValue({ mode: 'local', timeout: 1 });
@@ -664,6 +682,50 @@ describe('validation', () => {
         source: 'whisper',
         lang: 'en',
       });
+    });
+
+    it('does not write a late speech-to-text answer to the cache when skipCache is set', async () => {
+      (cacheSet as jest.Mock).mockClear();
+      jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue(null);
+      (whisper.getWhisperConfig as jest.Mock).mockReturnValue({ mode: 'local', timeout: 1 });
+      let lateResolve!: (v: string | null) => void;
+      (whisperJobs.startOrReuseWhisperJob as jest.Mock).mockReturnValue(
+        new Promise<string | null>((resolve) => {
+          lateResolve = resolve;
+        })
+      );
+
+      await expect(
+        validateAndDownloadSubtitles(
+          { url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', type: 'auto', lang: 'en' } as any,
+          undefined,
+          { skipCache: true }
+        )
+      ).rejects.toThrow(NotFoundError);
+      lateResolve('1\n00:00:00,000 --> 00:00:01,000\nLate probe');
+      await new Promise<void>((resolve) => setImmediate(resolve));
+
+      expect(cacheSet).not.toHaveBeenCalled();
+    });
+
+    it('does not start speech-to-text for a probe whose track is empty', async () => {
+      // The canary's options: an answer from speech-to-text would pass the probe while captions fail.
+      const probe = { skipCache: true, skipWhisper: true };
+      jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue(null);
+      (whisper.getWhisperConfig as jest.Mock).mockReturnValue({ mode: 'local', timeout: 600_000 });
+      (whisperJobs.startOrReuseWhisperJob as jest.Mock)
+        .mockClear()
+        .mockResolvedValue('1\n00:00:00,000 --> 00:00:01,000\nWhisper transcript');
+
+      const err = await validateAndDownloadSubtitles(
+        { url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', type: 'official', lang: 'en' } as any,
+        undefined,
+        probe
+      ).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(NotFoundError);
+      expect((err as Error).message).not.toMatch(/speech-to-text/i);
+      expect(whisperJobs.startOrReuseWhisperJob).not.toHaveBeenCalled();
     });
 
     it('should throw NotFoundError when Whisper fallback is enabled but returns null', async () => {
@@ -746,14 +808,21 @@ describe('validation', () => {
         'auto',
         'en',
         undefined,
-        undefined,
-        expect.objectContaining({ id: '123' })
+        undefined
       );
-      // No id in the URL, so the id still costs one yt-dlp run.
+      // No id in the URL, so the id still costs one yt-dlp run — after the track, never in
+      // front of it: with the direct fetch gone, a JSON run first would double the wait.
       expect(youtube.fetchYtDlpJson).toHaveBeenCalled();
+      const [trackRun] = (youtube.downloadSubtitles as jest.Mock).mock.invocationCallOrder;
+      const [jsonRun] = (youtube.fetchYtDlpJson as jest.Mock).mock.invocationCallOrder;
+      expect(trackRun).toBeLessThan(jsonRun);
+      // That run still fills the caches the widgets read next.
+      expect((cacheSet as jest.Mock).mock.calls.map((c) => String(c[0]).split(':')[0])).toEqual(
+        expect.arrayContaining(['avail', 'info', 'chapters'])
+      );
     });
 
-    it('should read one JSON for the track URL, the id and the metadata caches', async () => {
+    it('should spend no JSON run on a YouTube URL: the id is in it, the track is the only run', async () => {
       jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('content');
       const jsonSpy = jest
         .spyOn(youtube, 'fetchYtDlpJson')
@@ -766,11 +835,7 @@ describe('validation', () => {
       } as any);
 
       expect(result.videoId).toBe('dQw4w9WgXcQ');
-      expect(jsonSpy).toHaveBeenCalledTimes(1);
-      // info, tracks and chapters are filled from that one run
-      expect((cacheSet as jest.Mock).mock.calls.map((c) => String(c[0]).split(':')[0])).toEqual(
-        expect.arrayContaining(['avail', 'info', 'chapters'])
-      );
+      expect(jsonSpy).not.toHaveBeenCalled();
     });
 
     it('should answer a private video with its reason, not "no subtitles for en"', async () => {
@@ -786,55 +851,15 @@ describe('validation', () => {
       ).rejects.toMatchObject({ name: 'YtDlpError', reason: 'private' });
     });
 
-    describe('auto-discover (lang and type omitted)', () => {
+    describe('auto-discover (lang omitted)', () => {
       const youtubeUrl = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
-
-      it('should use official subtitles when available', async () => {
-        jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue({
-          id: 'dQw4w9WgXcQ',
-          subtitles: { en: [], ru: [] },
-          automatic_captions: {},
-        });
-        const downloadSpy = jest
-          .spyOn(youtube, 'downloadSubtitles')
-          .mockResolvedValueOnce(null)
-          .mockResolvedValueOnce('official ru content');
-
-        const result = await validateAndDownloadSubtitles({ url: youtubeUrl } as any);
-
-        expect(result).toEqual({
-          videoId: 'dQw4w9WgXcQ',
-          type: 'official',
-          lang: 'ru',
-          subtitlesContent: 'official ru content',
-          source: 'youtube',
-        });
-        expect(downloadSpy).toHaveBeenNthCalledWith(
-          1,
-          youtubeUrl,
-          'official',
-          'en',
-          undefined,
-          undefined,
-          expect.objectContaining({ id: 'dQw4w9WgXcQ' })
-        );
-        expect(downloadSpy).toHaveBeenNthCalledWith(
-          2,
-          youtubeUrl,
-          'official',
-          'ru',
-          undefined,
-          undefined,
-          expect.objectContaining({ id: 'dQw4w9WgXcQ' })
-        );
-      });
 
       it('also stores the track it found under the key the explicit flow reads', async () => {
         // The transcript widget then asks for that track by name; a Whisper result has
-        // no track to name and stays under the auto-discovery key alone.
-        const storedSubKeys = async (url: string) => {
+        // no track to name and stays under the auto-discovery keys alone.
+        const storedSubKeys = async (url: string, type?: 'official' | 'auto') => {
           (cacheSet as jest.Mock).mockClear();
-          await validateAndDownloadSubtitles({ url } as any);
+          await validateAndDownloadSubtitles({ url, type });
           return (cacheSet as jest.Mock).mock.calls
             .map((call) => call[0] as string)
             .filter((key) => key.startsWith('sub:'));
@@ -859,7 +884,15 @@ describe('validation', () => {
         (whisperJobs.startOrReuseWhisperJob as jest.Mock).mockResolvedValue(
           '1\n00:00:00,000 --> 00:00:01,000\nWhisper transcript'
         );
-        expect(await storedSubKeys(youtubeUrl)).toEqual([`sub:${youtubeUrl}:auto-discovery:srt`]);
+        // Speech-to-text does not depend on the type: a call with or without one reads the
+        // same answer, whichever of them made it.
+        const heardKeys = [
+          `sub:${youtubeUrl}:auto-discovery:srt`,
+          `sub:${youtubeUrl}:auto-discovery:official:srt`,
+          `sub:${youtubeUrl}:auto-discovery:auto:srt`,
+        ];
+        expect(await storedSubKeys(youtubeUrl)).toEqual(heardKeys);
+        expect(await storedSubKeys(youtubeUrl, 'auto')).toEqual(heardKeys);
 
         // Facebook keys tracks by locale: the widget asks for `en_US` by name, so that
         // name gets its entry as well.
@@ -872,75 +905,6 @@ describe('validation', () => {
           `sub:${facebookUrl}:auto-discovery:srt`,
           `sub:${facebookUrl}:official:en_US:srt`,
         ]);
-      });
-
-      it('should prefer -orig auto subtitles for YouTube when available', async () => {
-        jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue({
-          id: 'dQw4w9WgXcQ',
-          subtitles: {},
-          automatic_captions: { en: [], 'en-orig': [], ru: [] },
-        });
-        const downloadSpy = jest
-          .spyOn(youtube, 'downloadSubtitles')
-          .mockResolvedValueOnce('en-orig content');
-
-        const result = await validateAndDownloadSubtitles({ url: youtubeUrl } as any);
-
-        expect(result).toEqual({
-          videoId: 'dQw4w9WgXcQ',
-          type: 'auto',
-          lang: 'en-orig',
-          subtitlesContent: 'en-orig content',
-          source: 'youtube',
-        });
-        expect(downloadSpy).toHaveBeenCalledWith(
-          youtubeUrl,
-          'auto',
-          'en-orig',
-          undefined,
-          undefined,
-          expect.objectContaining({ id: 'dQw4w9WgXcQ' })
-        );
-      });
-
-      it('should iterate auto list when no -orig for YouTube', async () => {
-        jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue({
-          id: 'dQw4w9WgXcQ',
-          subtitles: {},
-          automatic_captions: { en: [], ru: [] },
-        });
-        const downloadSpy = jest
-          .spyOn(youtube, 'downloadSubtitles')
-          .mockResolvedValueOnce(null)
-          .mockResolvedValueOnce('ru auto content');
-
-        const result = await validateAndDownloadSubtitles({ url: youtubeUrl } as any);
-
-        expect(result).toEqual({
-          videoId: 'dQw4w9WgXcQ',
-          type: 'auto',
-          lang: 'ru',
-          subtitlesContent: 'ru auto content',
-          source: 'youtube',
-        });
-        expect(downloadSpy).toHaveBeenNthCalledWith(
-          1,
-          youtubeUrl,
-          'auto',
-          'en',
-          undefined,
-          undefined,
-          expect.objectContaining({ id: 'dQw4w9WgXcQ' })
-        );
-        expect(downloadSpy).toHaveBeenNthCalledWith(
-          2,
-          youtubeUrl,
-          'auto',
-          'ru',
-          undefined,
-          undefined,
-          expect.objectContaining({ id: 'dQw4w9WgXcQ' })
-        );
       });
 
       it('should fallback to Whisper when no subtitles found', async () => {
@@ -976,7 +940,6 @@ describe('validation', () => {
       });
 
       it('should call cache.set when Whisper finishes after WHISPER_TIMEOUT (auto-discover)', async () => {
-        (cacheSet as jest.Mock).mockClear();
         jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue({
           id: 'dQw4w9WgXcQ',
           subtitles: {},
@@ -1003,6 +966,14 @@ describe('validation', () => {
         await new Promise<void>((resolve) => setImmediate(resolve));
 
         expect(cacheSet).toHaveBeenCalled();
+        const lateKeys = (cacheSet as jest.Mock).mock.calls
+          .filter(([, v]) => String(v).includes('Late transcript'))
+          .map(([key]) => key as string);
+        expect(lateKeys).toEqual([
+          `sub:${youtubeUrl}:auto-discovery:srt`,
+          `sub:${youtubeUrl}:auto-discovery:official:srt`,
+          `sub:${youtubeUrl}:auto-discovery:auto:srt`,
+        ]);
         const payloadCall = (cacheSet as jest.Mock).mock.calls.find(([, v]) =>
           String(v).includes('Late transcript')
         );
@@ -1037,8 +1008,7 @@ describe('validation', () => {
           'auto',
           'en',
           undefined,
-          undefined,
-          expect.objectContaining({ id: 'dQw4w9WgXcQ' })
+          undefined
         );
       });
     });
@@ -1412,6 +1382,67 @@ describe('validation', () => {
       );
     });
 
+    it('should let a repeated call wait for the capture already running', async () => {
+      // A client that stopped waiting called again with the same arguments, four times per
+      // video, and every call started its own ffmpeg next to the others (prod, 2026-09-24).
+      const pending: Array<() => void> = [];
+      const captureSpy = jest.spyOn(youtube, 'captureVideoFrame').mockImplementation(
+        () =>
+          new Promise((resolve) =>
+            pending.push(() =>
+              resolve({
+                ok: true,
+                videoId: 'dQw4w9WgXcQ',
+                data: Buffer.from('img'),
+                mimeType: 'image/jpeg',
+              })
+            )
+          )
+      );
+
+      const first = validateAndCaptureVideoFrame({ url, seconds: 10 });
+      const repeat = validateAndCaptureVideoFrame({ url, seconds: 10 });
+      const otherWidth = validateAndCaptureVideoFrame({ url, seconds: 10, width: 640 });
+      const otherTime = validateAndCaptureVideoFrame({ url, seconds: 20 });
+      expect(captureSpy).toHaveBeenCalledTimes(3);
+
+      pending.forEach((done) => done());
+      const [a, b] = await Promise.all([first, repeat, otherWidth, otherTime]);
+      expect(b.data).toBe(a.data);
+
+      // Once it has answered, the next call captures afresh.
+      const again = validateAndCaptureVideoFrame({ url, seconds: 10 });
+      expect(captureSpy).toHaveBeenCalledTimes(4);
+      pending[3]();
+      await again;
+    });
+
+    it('should hand a failed shared capture to every caller and then forget it', async () => {
+      let fail: (err: Error) => void = () => {};
+      const captureSpy = jest
+        .spyOn(youtube, 'captureVideoFrame')
+        .mockImplementation(() => new Promise((_resolve, reject) => (fail = reject)));
+
+      const first = validateAndCaptureVideoFrame({ url, seconds: 10 });
+      const repeat = validateAndCaptureVideoFrame({ url, seconds: 10 });
+      fail(new YtDlpError('timeout'));
+
+      await expect(first).rejects.toMatchObject({ reason: 'timeout' });
+      await expect(repeat).rejects.toMatchObject({ reason: 'timeout' });
+      expect(captureSpy).toHaveBeenCalledTimes(1);
+
+      captureSpy.mockResolvedValue({
+        ok: true,
+        videoId: 'dQw4w9WgXcQ',
+        data: Buffer.from('img'),
+        mimeType: 'image/jpeg',
+      });
+      await expect(validateAndCaptureVideoFrame({ url, seconds: 10 })).resolves.toMatchObject({
+        videoId: 'dQw4w9WgXcQ',
+      });
+      expect(captureSpy).toHaveBeenCalledTimes(2);
+    });
+
     it('should map timestamp_beyond_duration to ValidationError', async () => {
       jest.spyOn(youtube, 'captureVideoFrame').mockResolvedValue({
         ok: false,
@@ -1469,56 +1500,51 @@ describe('validation', () => {
   });
 });
 
+const tracks = (langs: string[]) =>
+  Object.fromEntries(langs.map((lang) => [lang, [{ ext: 'vtt', url: 'u' }]]));
+/** The metadata run's answer: the track lists and the language the platform reports. */
+const listing = (official: string[], auto: string[] = [], language?: string) =>
+  jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue({
+    id: 'dQw4w9WgXcQ',
+    language,
+    subtitles: tracks(official),
+    automatic_captions: tracks(auto),
+  } as never);
+const withTracks = (official: string[], auto: string[]): void => {
+  listing(official, auto);
+  jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue(null);
+};
+const failureOf = (request: Record<string, unknown>) =>
+  validateAndDownloadSubtitles(request as any).then(
+    () => new Error('no error'),
+    (e: Error) => e
+  );
+const messageOf = async (request: Record<string, unknown>) => (await failureOf(request)).message;
+
 describe('the answer when no subtitles came back', () => {
   const url = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
   const NEXT_STEPS =
-    /Do not repeat the same call|Do not retry|You may retry the same call once in a few minutes|To try a track auto-discovery skipped|Omit type and lang to let the server choose/g;
-
-  const withTracks = (official: string[], auto: string[]): void => {
-    jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue({
-      id: 'dQw4w9WgXcQ',
-      subtitles: Object.fromEntries(official.map((l) => [l, [{ ext: 'vtt', url: 'u' }]])),
-      automatic_captions: Object.fromEntries(auto.map((l) => [l, [{ ext: 'vtt', url: 'u' }]])),
-    } as any);
-    jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue(null);
-  };
-
-  const messageOf = async (request: Record<string, unknown>): Promise<string> =>
-    validateAndDownloadSubtitles(request as any).then(
-      () => 'no error',
-      (e: Error) => e.message
-    );
+    /Do not repeat the same call|Do not retry|You may retry the same call once in a few minutes|To try a track auto-discovery skipped|Omit type and lang to let the server choose|Pass a type and lang the video actually has/g;
 
   beforeEach(() => {
-    (whisper.getWhisperConfig as jest.Mock).mockReturnValue({ mode: 'off' });
     (whisperJobs.startOrReuseWhisperJob as jest.Mock).mockResolvedValue(null);
   });
 
-  it('says how many tracks auto-discovery asked for, without claiming which', async () => {
+  it('says why auto-discovery asked for no track', async () => {
     withTracks(['en'], ['ru']);
 
     const message = await messageOf({ url });
 
-    expect(message).toContain('No subtitles could be downloaded');
-    expect(message).toContain('at most 2');
-    // "one official and one auto" would be false: with one list empty both attempts go
-    // to the other one.
-    expect(message).not.toMatch(/the best official and the best automatic/);
+    expect(message).toContain('does not say which language the video is spoken in');
+    expect(message).not.toMatch(/at most \d/);
   });
 
   it('separates a list it could not read from a list that is empty', async () => {
-    withTracks(['en'], ['ru']);
-    // The probe at the throw site re-reads the list; this is the read that fails.
-    jest
-      .spyOn(youtube, 'fetchYtDlpJson')
-      .mockResolvedValueOnce({
-        id: 'dQw4w9WgXcQ',
-        subtitles: { en: [{ ext: 'vtt', url: 'u' }] },
-        automatic_captions: { ru: [{ ext: 'vtt', url: 'u' }] },
-      } as any)
-      .mockResolvedValue(null);
+    jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue(null);
+    // A request by name reads the list only at the throw site; this is the read that fails.
+    jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue(null);
 
-    const unreadable = await messageOf({ url });
+    const unreadable = await messageOf({ url, type: 'official', lang: 'en' });
 
     expect(unreadable).toContain('could not be read');
     expect(unreadable).not.toContain('lists no subtitle tracks');
@@ -1536,7 +1562,7 @@ describe('the answer when no subtitles came back', () => {
       validateAndDownloadSubtitles({ url, type: 'auto', lang: 'ru' } as any)
     ).rejects.toMatchObject({
       name: 'NotFoundError',
-      details: { official: ['en'], auto: ['ru'], tried: 'ru' },
+      details: { official: ['en'], auto: ['ru'], tried: { type: 'auto', lang: 'ru' } },
     });
   });
 
@@ -1547,7 +1573,8 @@ describe('the answer when no subtitles came back', () => {
     const bothGiven = await messageOf({ url, type: 'auto', lang: 'ru' });
 
     expect(oneGiven).toContain('No auto subtitles could be downloaded for language "ru"');
-    expect(oneGiven).toContain('defaults to type "auto" and lang "en"');
+    expect(oneGiven).toContain('type defaults to "auto"');
+    expect(oneGiven).not.toContain('lang "en"');
     expect(bothGiven).not.toContain('defaults to');
   });
 
@@ -1571,7 +1598,7 @@ describe('the answer when no subtitles came back', () => {
   });
 
   it('offers the way out that fits the flow', async () => {
-    withTracks(['en'], ['ru']);
+    withTracks(['en'], ['en', 'en-orig', 'ru']);
 
     const auto = await messageOf({ url });
     const explicit = await messageOf({ url, type: 'auto', lang: 'ru' });
@@ -1579,6 +1606,27 @@ describe('the answer when no subtitles came back', () => {
     expect(auto).toContain('pass type and lang explicitly');
     expect(auto).not.toContain('Omit type and lang');
     expect(explicit).toContain('Omit type and lang');
+
+    // Where omitting lang gets the list answer, a caller who named a missing track is not
+    // sent there.
+    withTracks(['en'], ['ru']);
+    const listOnly = await messageOf({ url, type: 'auto', lang: 'ru' });
+    expect(listOnly).toContain('Pass a type and lang the video actually has');
+    expect(listOnly).not.toContain('Omit type and lang');
+  });
+
+  it('does not send a caller back to the track that just came back empty, under either name', async () => {
+    // YouTube lists its speech track as `ru` and `ru-orig`, with one URL: auto-discovery
+    // would ask for the same empty track again.
+    for (const [official, auto, request] of [
+      [[], ['ru', 'ru-orig'], { type: 'auto', lang: 'ru' }],
+      [['en'], ['en', 'en-orig'], { type: 'official', lang: 'en' }],
+    ] as Array<[string[], string[], Record<string, unknown>]>) {
+      withTracks(official, auto);
+      const message = await messageOf({ url, ...request });
+      expect(message).toContain('Pass a type and lang the video actually has');
+      expect(message).not.toContain('Omit type and lang');
+    }
   });
 
   it('says this server does not transcribe audio when it does not', async () => {
@@ -1624,19 +1672,399 @@ describe('the answer when no subtitles came back', () => {
   });
 
   it('keeps a classified failure instead of reporting missing subtitles', async () => {
-    withTracks(['en'], ['ru']);
-    jest
-      .spyOn(youtube, 'fetchYtDlpJson')
-      .mockResolvedValueOnce({
-        id: 'dQw4w9WgXcQ',
-        subtitles: { en: [{ ext: 'vtt', url: 'u' }] },
-        automatic_captions: {},
-      } as any)
-      .mockRejectedValue(new YtDlpError('private'));
+    jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue(null);
+    jest.spyOn(youtube, 'fetchYtDlpJson').mockRejectedValue(new YtDlpError('private'));
 
-    await expect(validateAndDownloadSubtitles({ url } as any)).rejects.toMatchObject({
+    await expect(
+      validateAndDownloadSubtitles({ url, type: 'official', lang: 'en' } as any)
+    ).rejects.toMatchObject({
       name: 'YtDlpError',
       reason: 'private',
     });
+  });
+});
+
+describe('an omitted lang means the original language', () => {
+  const url = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+  const id = 'dQw4w9WgXcQ';
+  async function counter(series: string): Promise<number> {
+    const line = (await renderPrometheus()).split('\n').find((l) => l.startsWith(series));
+    return line ? Number(line.split(' ').pop()) : 0;
+  }
+  const untried = () => counter('subtitle_tracks_untried_total{platform="youtube"');
+  const failures = () => counter('subtitles_extraction_failures_total{reason="no_subtitles"');
+  /** The one track auto-discovery asks for on this listing, as [type, lang]. */
+  const picked = async (official: string[], auto: string[], language?: string) => {
+    listing(official, auto, language);
+    const download = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('WEBVTT\n\nhello');
+    const { type, lang } = await validateAndDownloadSubtitles({ url });
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(download).toHaveBeenCalledWith(url, type, lang, undefined, undefined);
+    return [type, lang];
+  };
+
+  beforeEach(() => {
+    (whisperJobs.startOrReuseWhisperJob as jest.Mock).mockResolvedValue(null);
+  });
+
+  /** A cache that keeps what the server stores, as Redis would within the TTL. */
+  const memoryCache = (): void => {
+    const store = new Map<string, string>();
+    (cacheSet as jest.Mock).mockImplementation((key: string, value: string) => {
+      store.set(key, value);
+      return Promise.resolve();
+    });
+    (cacheGet as jest.Mock).mockImplementation((key: string) => Promise.resolve(store.get(key)));
+  };
+
+  it.each([
+    { flow: 'without lang', request: {}, mark: 'official:en' },
+    { flow: 'by name', request: { type: 'auto', lang: 'de' }, mark: 'auto:de' },
+  ])(
+    'remembers a track that brought no text, so the same call again asks for nothing ($flow)',
+    async ({ request, mark }) => {
+      memoryCache();
+      listing(['en'], ['de', 'en', 'en-orig']);
+      const download = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('');
+
+      const first = await failureOf({ url, ...request });
+      const second = await failureOf({ url, ...request });
+
+      expect(second).toBeInstanceOf(NotFoundError);
+      expect(second.message).toBe(first.message);
+      expect(download).toHaveBeenCalledTimes(1);
+      // The metadata TTL (CACHE_TTL_METADATA_SECONDS, 3600 in this mock), not the subtitles TTL:
+      // a temporary failure must not answer "no text" for a week.
+      expect(cacheSet).toHaveBeenCalledWith(
+        `sub:${url}:${mark}:srt:empty`,
+        expect.any(String),
+        3600
+      );
+    }
+  );
+
+  it('does not remember a failed track run, so the next call asks again', async () => {
+    memoryCache();
+    listing(['en'], ['de', 'en', 'en-orig']);
+    const download = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue(null);
+
+    await failureOf({ url, type: 'auto', lang: 'de' });
+    await failureOf({ url, type: 'auto', lang: 'de' });
+
+    expect(download).toHaveBeenCalledTimes(2);
+    expect(cacheSet).not.toHaveBeenCalledWith(
+      expect.stringMatching(/:empty$/),
+      expect.anything(),
+      expect.anything()
+    );
+  });
+
+  it('names a track off YouTube after a list answer without another metadata run', async () => {
+    memoryCache();
+    const vimeo = 'https://vimeo.com/123';
+    const metadata = listing(['de', 'fr'], []);
+    const download = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('WEBVTT\n\nhallo');
+
+    // No language reported and two tracks: the caller gets the list and picks one.
+    expect(await failureOf({ url: vimeo })).toMatchObject({ details: { official: ['de', 'fr'] } });
+    expect(
+      await validateAndDownloadSubtitles({ url: vimeo, type: 'official', lang: 'de' })
+    ).toMatchObject({ videoId: id, lang: 'de', subtitlesContent: 'WEBVTT\n\nhallo' });
+
+    // The video id comes from the list the first call cached, not from a second run.
+    expect(metadata).toHaveBeenCalledTimes(1);
+    expect(download).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers an English video that lists an Arabic official track with its en-orig track, in one request', async () => {
+    expect(await picked(['ar'], ['ar', 'de', 'en', 'en-orig'], 'en')).toEqual(['auto', 'en-orig']);
+  });
+
+  it('asks for the official track in the original language before the -orig one', async () => {
+    expect(await picked(['ar', 'en'], ['ar', 'en', 'en-orig'])).toEqual(['official', 'en']);
+  });
+
+  it('reads the original language from the -orig track of a cached list', async () => {
+    // The list another tool has just cached, and no metadata run to fall back on: the -orig
+    // track still names the language.
+    jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('WEBVTT\n\nhello');
+    (cacheGet as jest.Mock).mockImplementation((key: string) =>
+      Promise.resolve(
+        key === buildCacheKey('avail', url)
+          ? JSON.stringify({ videoId: id, official: ['ar', 'ru'], auto: ['ru', 'ru-orig'] })
+          : undefined
+      )
+    );
+    expect(await validateAndDownloadSubtitles({ url })).toMatchObject({
+      type: 'official',
+      lang: 'ru',
+    });
+  });
+
+  it('keeps the language a platform reports with the cached track list', async () => {
+    const vimeo = 'https://vimeo.com/123';
+    const availKey = buildCacheKey('avail', vimeo);
+    jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('WEBVTT\n\nhallo');
+    listing(['de', 'en'], [], 'de');
+    expect(await validateAndDownloadSubtitles({ url: vimeo })).toMatchObject({ lang: 'de' });
+
+    // No -orig off YouTube: without the reported language the cached list would be a guess.
+    const stored = (cacheSet as jest.Mock).mock.calls.find((call) => call[0] === availKey)?.[1] as
+      | string
+      | undefined;
+    jest.spyOn(youtube, 'fetchYtDlpJson').mockResolvedValue(null);
+    (cacheGet as jest.Mock).mockImplementation((key: string) =>
+      Promise.resolve(key === availKey ? stored : undefined)
+    );
+    expect(await validateAndDownloadSubtitles({ url: vimeo })).toMatchObject({ lang: 'de' });
+  });
+
+  it.each([
+    {
+      when: 'no track is in the original language',
+      lists: [['ar'], [], 'en'],
+      details: { official: ['ar'], auto: [] },
+      why: 'original language ("en")',
+    },
+    {
+      when: 'the language is unknown and more than one track is listed',
+      lists: [['de', 'fr'], []],
+      details: { official: ['de', 'fr'], auto: [] },
+      why: 'does not say which language',
+    },
+    {
+      when: 'a dubbed video lists several -orig tracks and nothing names the original',
+      lists: [[], ['ar-orig', 'en-orig']],
+      details: { official: [], auto: ['ar-orig', 'en-orig'] },
+      why: 'does not say which language',
+    },
+    {
+      when: 'nothing of the given type is listed',
+      request: { type: 'official' },
+      lists: [[], ['en', 'en-orig']],
+      details: { official: [], auto: ['en', 'en-orig'] },
+      why: 'lists no official tracks',
+    },
+  ] as Array<{
+    when: string;
+    request?: Record<string, unknown>;
+    lists: [string[], string[], string?];
+    details: object;
+    why: string;
+  }>)(
+    'answers with the track list, and asks for nothing, when $when',
+    async ({ request, lists, details, why }) => {
+      listing(...lists);
+      const download = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('WEBVTT\n\nhi');
+
+      const error = await failureOf({ url, ...request });
+
+      expect(error).toMatchObject({ name: 'NotFoundError', details });
+      expect(error.message).toContain(why);
+      expect(error.message).toContain('pass type and lang explicitly');
+      expect(error.message).not.toMatch(/defaults to|lang "en"/);
+      expect(download).not.toHaveBeenCalled();
+    }
+  );
+
+  it('reads "und" as no language, so the only track is still taken', async () => {
+    expect(await picked(['en'], [], 'und')).toEqual(['official', 'en']);
+  });
+
+  it('asks for one track only: an empty one gets the list, not a second track or speech-to-text', async () => {
+    (whisper.getWhisperConfig as jest.Mock).mockReturnValue({ mode: 'local', timeout: 600_000 });
+    listing(['en'], ['en', 'en-orig']);
+    const download = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue(null);
+    const failuresBefore = await failures();
+    const untriedBefore = await untried();
+
+    const error = await failureOf({ url });
+
+    expect(error).toMatchObject({
+      name: 'NotFoundError',
+      details: { tried: { type: 'official', lang: 'en' } },
+    });
+    expect(error.message).not.toContain('Speech-to-text');
+    expect(download).toHaveBeenCalledTimes(1);
+    expect(whisperJobs.startOrReuseWhisperJob).not.toHaveBeenCalled();
+    // Speech-to-text did not run, so this is no "no subtitles" failure: the caller has a list.
+    expect(await failures()).toBe(failuresBefore);
+    // One asked for and empty: the other two are what the list answer left.
+    expect(await untried()).toBe(untriedBefore + 2);
+  });
+
+  it('does not say an empty track is empty when the request may have failed', async () => {
+    // A download that failed for a reason about this video (age, region, an unclassified
+    // error) also comes back as no text: the answer must not call the track empty.
+    withTracks(['en'], ['en', 'en-orig']);
+
+    const error = await failureOf({ url });
+
+    expect(error.message).toContain('asked for the official track "en" and got no text');
+    expect(error.message).not.toContain('came back empty');
+  });
+
+  it('does not take a speech-to-text answer stored under a track name for that track', async () => {
+    // A request by name that got an empty track falls back to speech-to-text and stores the
+    // answer under the track's name. Auto-discovery owes the list answer there, not that text.
+    listing(['en'], ['en', 'en-orig'], 'en');
+    const download = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('WEBVTT\n\ntrack');
+    const heard = {
+      videoId: id,
+      type: 'official',
+      lang: 'en',
+      subtitlesContent: 'x',
+      source: 'whisper',
+    };
+    (cacheGet as jest.Mock).mockImplementation((key: string) =>
+      Promise.resolve(key === `sub:${url}:official:en:srt` ? JSON.stringify(heard) : undefined)
+    );
+
+    expect(await validateAndDownloadSubtitles({ url })).toMatchObject({
+      type: 'official',
+      lang: 'en',
+      source: 'youtube',
+    });
+    expect(download).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts a track read from the cache as a cache hit', async () => {
+    listing(['en'], ['en', 'en-orig']);
+    const cachedEn = { videoId: id, type: 'official', lang: 'en', subtitlesContent: 'cached' };
+    (cacheGet as jest.Mock).mockImplementation((key: string) =>
+      Promise.resolve(key === `sub:${url}:official:en:srt` ? JSON.stringify(cachedEn) : undefined)
+    );
+    const hits = () => counter('cache_hits_total{kind="sub"');
+    const before = await hits();
+
+    expect(await validateAndDownloadSubtitles({ url })).toEqual(cachedEn);
+    expect(await hits()).toBe(before + 1);
+  });
+
+  it('asks for lang off YouTube when the platform lists no tracks', async () => {
+    // TikTok, Bilibili and Reddit show their tracks only to a request that names one, so an
+    // empty list there does not mean that no type or lang will work.
+    const tiktok = 'https://www.tiktok.com/@someone/video/1';
+    withTracks([], []);
+
+    const plain = (await failureOf({ url: tiktok })).message;
+    expect(plain).toContain('pass lang');
+    expect(plain).not.toMatch(/no type or lang will work|Do not repeat/);
+
+    // With a type the caller is one lang away from a track, so speech-to-text does not start.
+    (whisper.getWhisperConfig as jest.Mock).mockReturnValue({ mode: 'local', timeout: 600_000 });
+    const typed = (await failureOf({ url: tiktok, type: 'official' })).message;
+    expect(typed).toContain('pass lang');
+    expect(whisperJobs.startOrReuseWhisperJob).not.toHaveBeenCalled();
+
+    // Without a type speech-to-text runs, and here it produces nothing: that is a failure.
+    const before = await failures();
+    await failureOf({ url: tiktok });
+    expect(await failures()).toBe(before + 1);
+  });
+
+  it('treats chat replays as no subtitles: speech-to-text runs and the chat is never asked for', async () => {
+    (whisper.getWhisperConfig as jest.Mock).mockReturnValue({ mode: 'local', timeout: 600_000 });
+    (whisperJobs.startOrReuseWhisperJob as jest.Mock).mockResolvedValue(
+      '1\n00:00:00,000 --> 00:00:01,000\nhello'
+    );
+    const download = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('{"chat":1}');
+
+    for (const [pageUrl, chat] of [
+      [url, 'live_chat'],
+      ['https://www.twitch.tv/videos/1', 'rechat'],
+    ]) {
+      listing([chat]);
+      expect(await validateAndDownloadSubtitles({ url: pageUrl })).toMatchObject({
+        source: 'whisper',
+      });
+    }
+    expect(download).not.toHaveBeenCalled();
+  });
+
+  it.each(['en_US', 'en-US', 'en-x-autogen'])(
+    'matches %s to an original language of en',
+    async (code) => {
+      expect(await picked(['ar', code], [], 'en')).toEqual(['official', code]);
+    }
+  );
+
+  it('keeps to the type it was given when lang is omitted', async () => {
+    listing(['ar', 'en'], ['ar', 'en', 'en-orig']);
+    const download = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('WEBVTT\n\nhello');
+
+    expect(await validateAndDownloadSubtitles({ url, type: 'auto' })).toMatchObject({
+      type: 'auto',
+      lang: 'en-orig',
+    });
+    expect(download).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets the reported language pick among the -orig tracks of a dubbed video', async () => {
+    expect(await picked(['ar', 'en'], ['ar', 'ar-orig', 'de-orig', 'en', 'en-orig'], 'en')).toEqual(
+      ['official', 'en']
+    );
+  });
+
+  it('keeps a lone -orig track ahead of a reported language that disagrees', async () => {
+    expect(await picked(['de', 'en'], ['en', 'en-orig'], 'de')).toEqual(['official', 'en']);
+  });
+
+  it('reads a track already cached under its own name instead of asking for it again', async () => {
+    listing(['ar', 'en'], ['en', 'en-orig']);
+    const download = jest.spyOn(youtube, 'downloadSubtitles').mockResolvedValue('WEBVTT\n\nnew');
+    const cachedEn = { videoId: id, type: 'official', lang: 'en', subtitlesContent: 'cached' };
+    (cacheGet as jest.Mock).mockImplementation((key: string) =>
+      Promise.resolve(key === `sub:${url}:official:en:srt` ? JSON.stringify(cachedEn) : undefined)
+    );
+
+    expect(await validateAndDownloadSubtitles({ url, type: 'official' })).toEqual(cachedEn);
+    expect(download).not.toHaveBeenCalled();
+  });
+
+  it('says there is nothing left to try when the only listed track came back empty', async () => {
+    withTracks(['en-x-autogen'], []);
+
+    const error = await failureOf({ url: 'https://vimeo.com/123' });
+
+    expect(error.message).toContain('Do not repeat the same call');
+
+    // YouTube's `en` and `en-orig` are one track under two names: nothing else is left either.
+    listing([], ['en', 'en-orig']);
+    const twins = await failureOf({ url });
+    expect(twins.message).toContain('Do not repeat the same call');
+    expect(twins).toMatchObject({ details: { tried: { type: 'auto', lang: 'en-orig' } } });
+  });
+
+  it('never lists a chat replay as a subtitle track', async () => {
+    withTracks(['en', 'live_chat'], ['en-orig']);
+
+    expect(await validateAndFetchAvailableSubtitles({ url })).toEqual({
+      videoId: id,
+      official: ['en'],
+      auto: ['en-orig'],
+    });
+    // A list cached before the filter still has the chat in it.
+    (cacheGet as jest.Mock).mockImplementation((key: string) =>
+      Promise.resolve(
+        key === buildCacheKey('avail', url)
+          ? JSON.stringify({ videoId: id, official: ['en', 'live_chat'], auto: [] })
+          : undefined
+      )
+    );
+    expect(await validateAndFetchAvailableSubtitles({ url })).toMatchObject({ official: ['en'] });
+    (cacheGet as jest.Mock).mockReset().mockResolvedValue(undefined);
+    listing(['rechat']);
+    expect(
+      await failureOf({ url: 'https://www.twitch.tv/videos/1', type: 'official', lang: 'en' })
+    ).toMatchObject({ details: { official: [], auto: [] } });
+  });
+
+  it('counts the tracks a list answer did not ask for', async () => {
+    withTracks(['ar', 'de'], ['fr']);
+    const before = await untried();
+
+    await expect(validateAndDownloadSubtitles({ url })).rejects.toThrow(NotFoundError);
+    expect(await untried()).toBe(before + 3);
   });
 });

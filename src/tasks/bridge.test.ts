@@ -53,3 +53,4 @@ it('returns durable handles only to capable clients and protects the real lifecy
     expect(calls).toBe(1);
     expect(JSON.stringify(complete.body)).not.toContain('private-owner');
   } finally { await handler.close(); rmSync(directory, { recursive: true, force: true }); }
+});
